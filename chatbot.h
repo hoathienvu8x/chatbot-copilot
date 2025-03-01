@@ -3,5 +3,6 @@
 
 const char * greetUser();
 const char * handleInput(char *input);
+int loadResponses();
 
 #endif

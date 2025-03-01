@@ -108,6 +108,12 @@ int chatbot_server() {
     exit(EXIT_FAILURE);
   }
 
+  if (loadResponses()) {
+    #ifdef NDEBUG
+    printf("Failed to load chat data\n");
+    #endif
+  }
+
   printf("Chatbot server started on port %d\n", CHATBOT_PORT);
 
   FD_ZERO(&active_fd_set);
