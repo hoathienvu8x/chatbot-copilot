@@ -63,7 +63,18 @@ static int handleServerResponse(int server_socket) {
     return -1;
   }
   buffer[bytes_read] = '\0';
-  printf("Server: %s\n", buffer);
+  cJSON *obj = cJSON_Parse(buffer);
+  if (!cJSON_IsObject(obj) || !cJSON_HasObjectItem(obj, "response")) {
+    printf("Server: %s\n", buffer);
+  } else {
+    cJSON *response = cJSON_GetObjectItem(obj, "response");
+    if (!cJSON_IsString(response)) {
+      printf("Server: %s\n", buffer);
+    } else {
+      printf("Server: %s\n", cJSON_GetStringValue(response));
+    }
+  }
+  cJSON_free(obj);
   return 0;
 }
 
