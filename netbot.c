@@ -9,23 +9,42 @@
 #include <sys/select.h>
 #include "netbot.h"
 #include "chatbot.h"
+#include "cJSON.h"
 
 #define CHATBOT_PORT 8080
 #define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
 
+static int sendJSONResponse(int client_socket, const char *message) {
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddStringToObject(response, "response", message);
+    #ifndef NDEBUG
+    const char *json_response = cJSON_Print(response);
+    #else
+    const char *json_response = cJSON_PrintUnformatted(response);
+    #endif
+    int ret = write(client_socket, json_response, strlen(json_response));
+    cJSON_Delete(response);
+    free((void *)json_response);
+    if (ret <= 0) return -1;
+    return 0;
+}
+
 static int handleClientMessage(int client_socket) {
   char buffer[BUFFER_SIZE];
   int bytes_read = read(client_socket, buffer, sizeof(buffer) - 1);
   if (bytes_read <= 0) {
+    #ifndef NDEBUG
     printf("Client disconnected\n");
+    #endif
     return -1;
   }
   buffer[bytes_read] = '\0';
+  #ifndef NDEBUG
   printf("Received message: %s\n", buffer);
-
+  #endif
   const char *resp = handleInput(buffer);
-  if (write(client_socket, resp, strlen(resp)) <= 0) {
+  if (sendJSONResponse(client_socket, resp) < 0) {
     return -1;
   }
   if (strstr(buffer, "bye") != NULL || strstr(buffer, "exit") != NULL) {
@@ -38,7 +57,9 @@ static int handleServerResponse(int server_socket) {
   char buffer[BUFFER_SIZE];
   int bytes_read = read(server_socket, buffer, sizeof(buffer) - 1);
   if (bytes_read <= 0) {
+    #ifndef NDEBUG
     printf("Server disconnected\n");
+    #endif
     return -1;
   }
   buffer[bytes_read] = '\0';
@@ -53,7 +74,9 @@ int chatbot_server() {
 
   server_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (server_socket == 0) {
+    #ifndef NDEBUG
     perror("Socket failed");
+    #endif
     exit(EXIT_FAILURE);
   }
 
@@ -62,19 +85,25 @@ int chatbot_server() {
   address.sin_port = htons(CHATBOT_PORT);
 
   if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) < 0) {
+    #ifndef NDEBUG
     perror("setsockopt failed");
+    #endif
     close(server_socket);
     exit(EXIT_FAILURE);
   }
 
   if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    #ifndef NDEBUG
     perror("Bind failed");
+    #endif
     close(server_socket);
     exit(EXIT_FAILURE);
   }
 
   if (listen(server_socket, 3) < 0) {
+    #ifndef NDEBUG
     perror("Listen failed");
+    #endif
     close(server_socket);
     exit(EXIT_FAILURE);
   }
@@ -91,25 +120,30 @@ int chatbot_server() {
     activity = select(max_sd + 1, &read_fds, NULL, NULL, NULL);
 
     if ((activity < 0) && (errno != EINTR)) {
+      #ifndef NDEBUG
       perror("Select error");
+      #endif
     }
 
     if (FD_ISSET(server_socket, &read_fds)) {
       int addrlen = sizeof(address);
       client_socket = accept(server_socket, (struct sockaddr *)&address, (socklen_t*)&addrlen);
       if (client_socket < 0) {
+        #ifndef NDEBUG
         perror("Accept failed");
+        #endif
         break;
       }
-
+      #ifndef NDEBUG
       printf("New connection from %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+      #endif
 
       FD_SET(client_socket, &active_fd_set);
       if (client_socket > max_sd) {
         max_sd = client_socket;
       }
       const char *resp = greetUser();
-      if (write(client_socket, resp, strlen(resp)) <= 0) {
+      if (sendJSONResponse(client_socket, resp) < 0) {
         close(client_socket);
         FD_CLR(client_socket, &active_fd_set);
       }
@@ -143,31 +177,40 @@ int chatbot_client() {
 
   client_socket = socket(AF_INET, SOCK_STREAM, 0);
   if (client_socket < 0) {
+    #ifndef NDEBUG
     perror("Socket creation failed");
+    #endif
     exit(EXIT_FAILURE);
   }
 
   server_address.sin_family = AF_INET;
   server_address.sin_port = htons(CHATBOT_PORT);
   if (inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) <= 0) {
+    #ifndef NDEBUG
     perror("Invalid address or address not supported");
+    #endif
     close(client_socket);
     exit(EXIT_FAILURE);
   }
 
   if (setsockopt(client_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) < 0) {
+    #ifndef NDEBUG
     perror("setsockopt failed");
+    #endif
     close(client_socket);
     exit(EXIT_FAILURE);
   }
 
   if (connect(client_socket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
+    #ifndef NDEBUG
     perror("Connection failed");
+    #endif
     close(client_socket);
     exit(EXIT_FAILURE);
   }
-
+  #ifndef NDEBUG
   printf("Connected to the server at 127.0.0.1:%d\n", CHATBOT_PORT);
+  #endif
 
   while (1) {
     FD_ZERO(&read_fds);
@@ -179,7 +222,9 @@ int chatbot_client() {
     int activity = select(max_sd + 1, &read_fds, NULL, NULL, NULL);
 
     if ((activity < 0) && (errno != EINTR)) {
+      #ifndef NDEBUG
       perror("Select error");
+      #endif
     }
 
     if (FD_ISSET(STDIN_FILENO, &read_fds)) {

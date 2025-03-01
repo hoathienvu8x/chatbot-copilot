@@ -9,7 +9,7 @@ endif
 CFLAGS += -std=gnu99 -Wall -Wextra -Werror -pedantic
 RM = rm -rf
 
-OBJECTS = chatbot.o netbot.o
+OBJECTS = chatbot.o netbot.o cJSON.o
 OBJECTS := $(addprefix objects/,$(OBJECTS))
 EXECUTABLE = demo
 
