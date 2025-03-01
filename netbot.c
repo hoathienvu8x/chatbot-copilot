@@ -14,46 +14,40 @@
 #define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
 
-void handleClientMessage(int client_socket, fd_set active_fd_set) {
+static int handleClientMessage(int client_socket) {
   char buffer[BUFFER_SIZE];
   int bytes_read = read(client_socket, buffer, sizeof(buffer) - 1);
   if (bytes_read <= 0) {
     printf("Client disconnected\n");
-    goto done;
+    return -1;
   }
   buffer[bytes_read] = '\0';
   printf("Received message: %s\n", buffer);
 
   const char *resp = handleInput(buffer);
   if (write(client_socket, resp, strlen(resp)) <= 0) {
-    goto done;
+    return -1;
   }
   if (strstr(buffer, "bye") != NULL || strstr(buffer, "exit") != NULL) {
-    goto done;
+    return -1;
   }
-  return;
-
-done:
-  close(client_socket);
-  FD_CLR(client_socket, &active_fd_set);
+  return 0;
 }
 
-void handleServerResponse(int server_socket) {
+static int handleServerResponse(int server_socket) {
   char buffer[BUFFER_SIZE];
   int bytes_read = read(server_socket, buffer, sizeof(buffer) - 1);
   if (bytes_read <= 0) {
     printf("Server disconnected\n");
-    close(server_socket);
-    exit(EXIT_FAILURE);
-  } else {
-    buffer[bytes_read] = '\0';
-    printf("Server: %s\n", buffer);
+    return -1;
   }
+  buffer[bytes_read] = '\0';
+  printf("Server: %s\n", buffer);
+  return 0;
 }
 
 int chatbot_server() {
-  int server_socket, client_socket, max_sd, activity, i;
-  int client_sockets[MAX_CLIENTS] = {0};
+  int server_socket, client_socket, max_sd, activity, i, reuse = 1;
   struct sockaddr_in address;
   fd_set read_fds, active_fd_set;
 
@@ -66,6 +60,12 @@ int chatbot_server() {
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = INADDR_ANY;
   address.sin_port = htons(CHATBOT_PORT);
+
+  if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) < 0) {
+    perror("setsockopt failed");
+    close(server_socket);
+    exit(EXIT_FAILURE);
+  }
 
   if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0) {
     perror("Bind failed");
@@ -99,7 +99,7 @@ int chatbot_server() {
       client_socket = accept(server_socket, (struct sockaddr *)&address, (socklen_t*)&addrlen);
       if (client_socket < 0) {
         perror("Accept failed");
-        exit(EXIT_FAILURE);
+        break;
       }
 
       printf("New connection from %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
@@ -115,12 +115,20 @@ int chatbot_server() {
       }
     }
 
-    for (i = 0; i < MAX_CLIENTS; i++) {
-      client_socket = client_sockets[i];
-
-      if (FD_ISSET(client_socket, &read_fds)) {
-        handleClientMessage(client_socket, active_fd_set);
+    for (i = 0; i <= max_sd; i++) {
+      if (FD_ISSET(i, &read_fds)) {
+        if (handleClientMessage(i) < 0) {
+          close(i);
+          FD_CLR(i, &active_fd_set);
+        }
       }
+    }
+  }
+
+  for (i = 0; i <= max_sd; i++) {
+    if (FD_ISSET(i, &active_fd_set)) {
+      close(i);
+      FD_CLR(i, &active_fd_set);
     }
   }
 
@@ -128,7 +136,7 @@ int chatbot_server() {
 }
 
 int chatbot_client() {
-  int client_socket;
+  int client_socket, reuse = 1;
   struct sockaddr_in server_address;
   fd_set read_fds;
   char buffer[BUFFER_SIZE];
@@ -143,6 +151,12 @@ int chatbot_client() {
   server_address.sin_port = htons(CHATBOT_PORT);
   if (inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) <= 0) {
     perror("Invalid address or address not supported");
+    close(client_socket);
+    exit(EXIT_FAILURE);
+  }
+
+  if (setsockopt(client_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) < 0) {
+    perror("setsockopt failed");
     close(client_socket);
     exit(EXIT_FAILURE);
   }
@@ -169,6 +183,7 @@ int chatbot_client() {
     }
 
     if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+      memset(buffer, 0, sizeof(buffer));
       if (!fgets(buffer, sizeof(buffer), stdin)) {
         break;
       }
@@ -177,7 +192,7 @@ int chatbot_client() {
     }
 
     if (FD_ISSET(client_socket, &read_fds)) {
-      handleServerResponse(client_socket);
+      if (handleServerResponse(client_socket) < 0) break;
     }
   }
 
