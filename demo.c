@@ -6,8 +6,10 @@
 
 int main() {
   char input[MAX_INPUT];
+  const char *resp = NULL;
 
-  greetUser();
+  resp = greetUser();
+  printf("%s\n", resp);
 
   while (1) {
     printf("> ");
@@ -16,12 +18,11 @@ int main() {
     // Remove newline character from input
     input[strcspn(input, "\n")] = 0;
 
+    resp = handleInput(input);
+    printf("%s\n", resp);
     if (strcmp(input, "bye") == 0 || strcmp(input, "exit") == 0) {
-      handleInput(input);
       break;
     }
-
-    handleInput(input);
   }
 
   return 0;

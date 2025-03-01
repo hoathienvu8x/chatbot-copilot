@@ -2,22 +2,21 @@
 #include <string.h>
 #include "chatbot.h"
 
-void greetUser() {
-  printf("Hello! I am a simple chatbot created in C. How can I help you today?\n");
+const char * greetUser() {
+  return "Hello! I am a simple chatbot created in C. How can I help you today?\0";
 }
 
-void handleInput(char *input) {
+const char * handleInput(char *input) {
   if (strstr(input, "hello") != NULL || strstr(input, "hi") != NULL) {
-    printf("Hi there! How can I assist you?\n");
+    return "Hi there! How can I assist you?\0";
   } else if (strstr(input, "how are you") != NULL) {
-    printf("I'm just a program, so I don't have feelings, but thanks for asking!\n");
+    return "I'm just a program, so I don't have feelings, but thanks for asking!\0";
   } else if (strstr(input, "what is your name") != NULL) {
-    printf("I am a C chatbot. Nice to meet you!\n");
+    return "I am a C chatbot. Nice to meet you!\0";
   } else if (strstr(input, "bye") != NULL || strstr(input, "exit") != NULL) {
-    printf("Goodbye! Have a great day!\n");
-  } else {
-    printf("I'm sorry, I don't understand that. Can you ask something else?\n");
+    return "Goodbye! Have a great day!\0";
   }
+  return "I'm sorry, I don't understand that. Can you ask something else?\0";
 }
 
 

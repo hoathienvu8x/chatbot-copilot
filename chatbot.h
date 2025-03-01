@@ -1,7 +1,7 @@
 #ifndef _CHATBOT_H
 #define _CHATBOT_H
 
-void greetUser();
-void handleInput(char *input);
+const char * greetUser();
+const char * handleInput(char *input);
 
 #endif
