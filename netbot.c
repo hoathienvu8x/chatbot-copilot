@@ -47,7 +47,7 @@ static int handleClientMessage(int client_socket) {
   if (sendJSONResponse(client_socket, resp) < 0) {
     return -1;
   }
-  if (strstr(buffer, "bye") != NULL || strstr(buffer, "exit") != NULL) {
+  if (chatbot_strcasestr(buffer, "bye") != NULL || chatbot_strcasestr(buffer, "exit") != NULL) {
     return -1;
   }
   return 0;

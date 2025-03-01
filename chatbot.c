@@ -24,7 +24,7 @@ const char * handleInput(char *input) {
     cJSON *it;
     cJSON_ArrayForEach(it, tags) {
       const char *tag = cJSON_GetStringValue(it);
-      if (!tag || strstr(input, tag) == NULL) continue;
+      if (!tag || chatbot_strcasestr(input, tag) == NULL) continue;
       cJSON *answer = cJSON_GetObjectItem(el, "answer");
       return cJSON_GetStringValue(answer);
     }
@@ -76,4 +76,26 @@ int loadResponses() {
   }
 
   return 0;
+}
+
+int chatbot_strcasecmp(const char *_l, const char *_r) {
+  const unsigned char *l = (void *)_l, *r = (void *)_r;
+  unsigned char flipbit = ~(1 << 5);
+  for (; *l && *r && (*l == *r || (*l & flipbit) == (*r & flipbit)); l++,r++);
+  return (*l & flipbit) - (*r & flipbit);
+}
+
+
+int chatbot_strncasecmp(const char *_l, const char *_r, size_t n) {
+  const unsigned char *l = (void *)_l, *r = (void *)_r;
+  if (!n--) return 0;
+  unsigned char flipbit = ~(1 << 5);
+  for (; *l && *r && n && (*l == *r || (*l & flipbit) == (*r & flipbit)); l++, r++,n--);
+  return (*l & flipbit) - (*r & flipbit);
+}
+
+char *chatbot_strcasestr(const char *h, const char *n) {
+	size_t l = strlen(n);
+	for (; *h; h++) if (!chatbot_strncasecmp(h, n, l)) return (char *)h;
+	return 0;
 }
