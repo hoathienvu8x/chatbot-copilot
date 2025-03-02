@@ -10,7 +10,8 @@ cJSON *responses = NULL;
 
 const char * handleInput(char *input) {
   cJSON *el;
-  cJSON_ArrayForEach(el, responses) {
+  cJSON *answers = cJSON_GetObjectItem(responses, "answers");
+  cJSON_ArrayForEach(el, answers) {
     if (!cJSON_IsObject(el)) continue;
     if (!cJSON_HasObjectItem(el, "tags") || !cJSON_HasObjectItem(el, "answer")) {
       continue;
@@ -25,7 +26,8 @@ const char * handleInput(char *input) {
       return cJSON_GetStringValue(answer);
     }
   }
-  return "I'm sorry, I don't understand that. Can you ask something else?\0";
+  cJSON *answer = cJSON_GetObjectItem(responses, "unknown");
+  return cJSON_GetStringValue(answer);
 }
 
 const char * greetUser() {
@@ -68,11 +70,25 @@ int loadResponses() {
     return -1;
   }
 
-  if (!cJSON_IsArray(responses)) {
+  if (!cJSON_IsObject(responses) || !cJSON_HasObjectItem(responses, "answers")) {
     #ifndef NDEBUG
     fprintf(stderr, "Invalid reponses struct");
     #endif
     cJSON_free(responses);
+    return -1;
+  }
+
+  cJSON *answers = cJSON_GetObjectItem(responses, "answers");
+  if (!cJSON_IsArray(answers)) {
+    cJSON_free(responses);
+    return -1;
+  }
+
+  if (!cJSON_GetObjectItem(responses, "unknown")) {
+    cJSON_AddStringToObject(
+      responses, "unknown",
+      "I'm sorry, I don't understand that. Can you ask something else?"
+    );
   }
 
   return 0;

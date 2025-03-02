@@ -1,22 +1,25 @@
-[
-  {
-    "answer":"Hi there! How can I assist you?",
-    "tags":["hi","hello"]
-  },
-  {
-    "answer":"I'm just a program, so I don't have feelings, but thanks for asking!",
-    "tags":["how are you"]
-  },
-  {
-    "answer":"I am a C chatbot server. Nice to meet you!",
-    "tags":["what is your name"]
-  },
-  {
-    "answer":"Goodbye! Have a great day!",
-    "tags":["bye","exit"]
-  },
-  {
-    "answer":"Hello! I am a simple chatbot created in C. How can I help you today?",
-    "tags":["greet"]
-  }
-]
+{
+  "unknown":"I'm sorry, I don't understand that. Can you ask something else?",
+  "answers":[
+    {
+      "answer":"Hi there! How can I assist you?",
+      "tags":["hi","hello"]
+    },
+    {
+      "answer":"I'm just a program, so I don't have feelings, but thanks for asking!",
+      "tags":["how are you"]
+    },
+    {
+      "answer":"I am a C chatbot server. Nice to meet you!",
+      "tags":["what is your name"]
+    },
+    {
+      "answer":"Goodbye! Have a great day!",
+      "tags":["bye","exit"]
+    },
+    {
+      "answer":"Hello! I am a simple chatbot created in C. How can I help you today?",
+      "tags":["greet"]
+    }
+  ]
+}
