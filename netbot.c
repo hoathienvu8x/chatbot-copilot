@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <netdb.h>
 #include "netbot.h"
 #include "chatbot.h"
 #include "cJSON.h"
@@ -47,7 +48,10 @@ static int handleClientMessage(int client_socket) {
   if (sendJSONResponse(client_socket, resp) < 0) {
     return -1;
   }
-  if (chatbot_strcasestr(buffer, "bye") != NULL || chatbot_strcasestr(buffer, "exit") != NULL) {
+  if (
+    chatbot_strcasestr(buffer, "bye") != NULL ||
+    chatbot_strcasestr(buffer, "exit") != NULL
+  ) {
     return -1;
   }
   return 0;
@@ -78,36 +82,62 @@ static int handleServerResponse(int server_socket) {
   return 0;
 }
 
+static int chatbot_create_socket(
+  const char *host, const char *port,
+  int (*check)(int , const struct sockaddr *, socklen_t)
+) {
+  struct addrinfo hints, *results, *rp;
+  int sock = -1, reuse = 1;
+
+  memset(&hints, 0, sizeof(struct addrinfo));
+  hints.ai_flags = AI_PASSIVE;
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  if (getaddrinfo(host, port, &hints, &results)) {
+    #ifndef NDEBUG
+    fprintf(stderr, "getaddrinfo failed\n");
+    #endif
+    return -1;
+  }
+
+  for (rp = results; rp != NULL; rp = rp->ai_next) {
+    sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    if (sock < 0) continue;
+    if (setsockopt(
+      sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)
+    )) {
+      close(sock);
+      sock = -1;
+      continue;
+    }
+    if (check(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
+      break;
+    }
+    close(sock);
+    sock = -1;
+  }
+
+  freeaddrinfo(results);
+  if (rp == NULL) return -1;
+  return sock;
+}
+
 int chatbot_server() {
-  int server_socket, client_socket, max_sd, activity, i, reuse = 1;
+  int server_socket, client_socket, max_sd, activity, i;
   struct sockaddr_in address;
   fd_set read_fds, active_fd_set;
+  char port[8] = {0};
 
-  server_socket = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_socket == 0) {
+  if (snprintf(port, sizeof(port) - 1, "%d", CHATBOT_PORT) <= 0) {
+    exit(EXIT_FAILURE);
+  }
+
+  server_socket = chatbot_create_socket(NULL, port, bind);
+  if (server_socket <= 0) {
     #ifndef NDEBUG
     perror("Socket failed");
     #endif
-    exit(EXIT_FAILURE);
-  }
-
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = INADDR_ANY;
-  address.sin_port = htons(CHATBOT_PORT);
-
-  if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) < 0) {
-    #ifndef NDEBUG
-    perror("setsockopt failed");
-    #endif
-    close(server_socket);
-    exit(EXIT_FAILURE);
-  }
-
-  if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0) {
-    #ifndef NDEBUG
-    perror("Bind failed");
-    #endif
-    close(server_socket);
     exit(EXIT_FAILURE);
   }
 
@@ -187,44 +217,22 @@ int chatbot_server() {
 }
 
 int chatbot_client() {
-  int client_socket, reuse = 1;
-  struct sockaddr_in server_address;
+  int client_socket;
   fd_set read_fds;
   char buffer[BUFFER_SIZE];
 
-  client_socket = socket(AF_INET, SOCK_STREAM, 0);
-  if (client_socket < 0) {
+  if (snprintf(buffer, sizeof(buffer) - 1, "%d", CHATBOT_PORT) <= 0) {
+    exit(EXIT_FAILURE);
+  }
+
+  client_socket = chatbot_create_socket("127.0.0.1", buffer, connect);
+  if (client_socket <= 0) {
     #ifndef NDEBUG
     perror("Socket creation failed");
     #endif
     exit(EXIT_FAILURE);
   }
 
-  server_address.sin_family = AF_INET;
-  server_address.sin_port = htons(CHATBOT_PORT);
-  if (inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) <= 0) {
-    #ifndef NDEBUG
-    perror("Invalid address or address not supported");
-    #endif
-    close(client_socket);
-    exit(EXIT_FAILURE);
-  }
-
-  if (setsockopt(client_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) < 0) {
-    #ifndef NDEBUG
-    perror("setsockopt failed");
-    #endif
-    close(client_socket);
-    exit(EXIT_FAILURE);
-  }
-
-  if (connect(client_socket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
-    #ifndef NDEBUG
-    perror("Connection failed");
-    #endif
-    close(client_socket);
-    exit(EXIT_FAILURE);
-  }
   #ifndef NDEBUG
   printf("Connected to the server at 127.0.0.1:%d\n", CHATBOT_PORT);
   #endif

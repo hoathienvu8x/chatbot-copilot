@@ -8,10 +8,6 @@
 
 cJSON *responses = NULL;
 
-const char * greetUser() {
-  return "Hello! I am a simple chatbot created in C. How can I help you today?\0";
-}
-
 const char * handleInput(char *input) {
   cJSON *el;
   cJSON_ArrayForEach(el, responses) {
@@ -30,6 +26,10 @@ const char * handleInput(char *input) {
     }
   }
   return "I'm sorry, I don't understand that. Can you ask something else?\0";
+}
+
+const char * greetUser() {
+  return handleInput("greet");
 }
 
 int loadResponses() {

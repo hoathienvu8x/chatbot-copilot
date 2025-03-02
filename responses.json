@@ -14,5 +14,9 @@
   {
     "answer":"Goodbye! Have a great day!",
     "tags":["bye","exit"]
+  },
+  {
+    "answer":"Hello! I am a simple chatbot created in C. How can I help you today?",
+    "tags":["greet"]
   }
 ]
