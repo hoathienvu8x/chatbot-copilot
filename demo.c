@@ -10,15 +10,20 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 
-#define PRERF "(errno=%d) %s\n"
-#define PREAR(NUM) NUM, strerror(NUM)
+#ifndef NDEBUG
+  #define PRERF "(errno=%d) %s\n"
+  #define PREAR(NUM) NUM, strerror(NUM)
+#endif
 #define EPOLL_MAP_TO_NOP (0u)
 #define EPOLL_MAP_SHIFT  (1u) /* Shift to cover reserved value MAP_TO_NOP */
+
+#define array_size(a) (sizeof(a) / sizeof(*a))
+#define ipv4_size sizeof("xxx.xxx.xxx.xxx")
 
 struct client_slot {
   bool                is_used;
   int                 client_fd;
-  char                src_ip[sizeof("xxx.xxx.xxx.xxx")];
+  char                src_ip[ipv4_size];
   uint16_t            src_port;
   uint16_t            my_index;
 };
@@ -41,7 +46,6 @@ struct tcp_state {
 
 static int my_epoll_add(int epoll_fd, int fd, uint32_t events)
 {
-  int err;
   struct epoll_event event;
 
   /* Shut the valgrind up! */
@@ -50,8 +54,9 @@ static int my_epoll_add(int epoll_fd, int fd, uint32_t events)
   event.events  = events;
   event.data.fd = fd;
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
-    err = errno;
-    printf("epoll_ctl(EPOLL_CTL_ADD): " PRERF, PREAR(err));
+    #ifndef NDEBUG
+    printf("epoll_ctl(EPOLL_CTL_ADD): " PRERF, PREAR(errno));
+    #endif
     return -1;
   }
   return 0;
@@ -59,11 +64,10 @@ static int my_epoll_add(int epoll_fd, int fd, uint32_t events)
 
 static int my_epoll_delete(int epoll_fd, int fd)
 {
-  int err;
-
   if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL) < 0) {
-    err = errno;
-    printf("epoll_ctl(EPOLL_CTL_DEL): " PRERF, PREAR(err));
+    #ifndef NDEBUG
+    printf("epoll_ctl(EPOLL_CTL_DEL): " PRERF, PREAR(errno));
+    #endif
     return -1;
   }
   return 0;
@@ -71,15 +75,14 @@ static int my_epoll_delete(int epoll_fd, int fd)
 
 static const char *convert_addr_ntop(struct sockaddr_in *addr, char *src_ip_buf)
 {
-  int err;
   const char *ret;
   in_addr_t saddr = addr->sin_addr.s_addr;
 
-  ret = inet_ntop(AF_INET, &saddr, src_ip_buf, sizeof("xxx.xxx.xxx.xxx"));
+  ret = inet_ntop(AF_INET, &saddr, src_ip_buf, ipv4_size);
   if (ret == NULL) {
-    err = errno;
-    err = err ? err : EINVAL;
-    printf("inet_ntop(): " PRERF, PREAR(err));
+    #ifndef NDEBUG
+    printf("inet_ntop(): " PRERF, PREAR(errno ? errno : EINVAL));
+    #endif
     return NULL;
   }
 
@@ -88,31 +91,33 @@ static const char *convert_addr_ntop(struct sockaddr_in *addr, char *src_ip_buf)
 
 static int accept_new_client(int tcp_fd, struct tcp_state *state)
 {
-  int err;
   int client_fd;
   struct sockaddr_in addr;
   socklen_t addr_len = sizeof(addr);
   uint16_t src_port;
   const char *src_ip;
-  char src_ip_buf[sizeof("xxx.xxx.xxx.xxx")];
-  const size_t client_slot_num = sizeof(state->clients) / sizeof(*state->clients);
+  char src_ip_buf[ipv4_size];
+  const size_t client_slot_num = array_size(state->clients);
 
   memset(&addr, 0, sizeof(addr));
   client_fd = accept(tcp_fd, (struct sockaddr *)&addr, &addr_len);
   if (client_fd < 0) {
-    err = errno;
-    if (err == EAGAIN)
+    if (errno == EAGAIN)
       return 0;
 
+    #ifndef NDEBUG
     /* Error */
-    printf("accept(): " PRERF, PREAR(err));
+    printf("accept(): " PRERF, PREAR(errno));
+    #endif
     return -1;
   }
 
   src_port = ntohs(addr.sin_port);
   src_ip   = convert_addr_ntop(&addr, src_ip_buf);
   if (!src_ip) {
+    #ifndef NDEBUG
     printf("Cannot parse source address\n");
+    #endif
     goto out_close;
   }
 
@@ -149,11 +154,15 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state)
        */
       my_epoll_add(state->epoll_fd, client_fd, EPOLLIN | EPOLLPRI);
 
+      #ifndef NDEBUG
       printf("Client %s:%u has been accepted!\n", src_ip, src_port);
+      #endif
       return 0;
     }
   }
+  #ifndef NDEBUG
   printf("Sorry, can't accept more client at the moment, slot is full\n");
+  #endif
 
 out_close:
   close(client_fd);
@@ -163,7 +172,6 @@ out_close:
 static void handle_client_event(int client_fd, uint32_t revents,
                     struct tcp_state *state)
 {
-  int err;
   ssize_t recv_ret;
   char buffer[1024];
   const uint32_t err_mask = EPOLLERR | EPOLLHUP;
@@ -181,12 +189,13 @@ static void handle_client_event(int client_fd, uint32_t revents,
     goto close_conn;
 
   if (recv_ret < 0) {
-    err = errno;
-    if (err == EAGAIN)
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
       return;
 
+    #ifndef NDEBUG
     /* Error */
-    printf("recv(): " PRERF, PREAR(err));
+    printf("recv(): " PRERF, PREAR(errno));
+    #endif
     goto close_conn;
   }
 
@@ -203,8 +212,10 @@ static void handle_client_event(int client_fd, uint32_t revents,
   return;
 
 close_conn:
+  #ifndef NDEBUG
   printf("Client %s:%u has closed its connection\n", client->src_ip,
        client->src_port);
+  #endif
   my_epoll_delete(state->epoll_fd, client_fd);
   close(client_fd);
   client->is_used = false;
@@ -213,7 +224,6 @@ close_conn:
 
 static int event_loop(struct tcp_state *state)
 {
-  int err;
   int ret = 0;
   int timeout = 3000; /* in milliseconds */
   int maxevents = 32;
@@ -221,7 +231,9 @@ static int event_loop(struct tcp_state *state)
   int epoll_fd = state->epoll_fd;
   struct epoll_event events[32];
 
+  #ifndef NDEBUG
   printf("Entering event loop...\n");
+  #endif
 
   while (!state->stop) {
 
@@ -236,20 +248,25 @@ static int event_loop(struct tcp_state *state)
       /*
        *`epoll_wait` reached its timeout
        */
+      #ifndef NDEBUG
       printf("I don't see any event within %d milliseconds\n", timeout);
+      #endif
       continue;
     }
 
     if (epoll_ret == -1) {
-      err = errno;
-      if (err == EINTR) {
+      if (errno == EINTR || errno == EWOULDBLOCK) {
+        #ifndef NDEBUG
         printf("Something interrupted me!\n");
+        #endif
         continue;
       }
 
       /* Error */
       ret = -1;
-      printf("epoll_wait(): " PRERF, PREAR(err));
+      #ifndef NDEBUG
+      printf("epoll_wait(): " PRERF, PREAR(errno));
+      #endif
       break;
     }
 
@@ -280,16 +297,16 @@ out:
 
 static int init_epoll(struct tcp_state *state)
 {
-  int err;
   int epoll_fd;
 
   printf("Initializing epoll_fd...\n");
 
   /* The epoll_create argument is ignored on modern Linux */
-  epoll_fd = epoll_create(255);
+  epoll_fd = epoll_create1(0);
   if (epoll_fd < 0) {
-    err = errno;
-    printf("epoll_create(): " PRERF, PREAR(err));
+    #ifndef NDEBUG
+    printf("epoll_create(): " PRERF, PREAR(errno));
+    #endif
     return -1;
   }
 
@@ -300,18 +317,20 @@ static int init_epoll(struct tcp_state *state)
 static int init_socket(struct tcp_state *state)
 {
   int ret;
-  int err;
   int tcp_fd = -1;
   struct sockaddr_in addr;
   socklen_t addr_len = sizeof(addr);
   const char *bind_addr = "0.0.0.0";
   uint16_t bind_port = 1234;
 
+  #ifndef NDEBUG
   printf("Creating TCP socket...\n");
+  #endif
   tcp_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
   if (tcp_fd < 0) {
-    err = errno;
-    printf("socket(): " PRERF, PREAR(err));
+    #ifndef NDEBUG
+    printf("socket(): " PRERF, PREAR(errno));
+    #endif
     return -1;
   }
 
@@ -323,16 +342,18 @@ static int init_socket(struct tcp_state *state)
   ret = bind(tcp_fd, (struct sockaddr *)&addr, addr_len);
   if (ret < 0) {
     ret = -1;
-    err = errno;
-    printf("bind(): " PRERF, PREAR(err));
+    #ifndef NDEBUG
+    printf("bind(): " PRERF, PREAR(errno));
+    #endif
     goto out;
   }
 
   ret = listen(tcp_fd, 10);
   if (ret < 0) {
     ret = -1;
-    err = errno;
-    printf("listen(): " PRERF, PREAR(err));
+    #ifndef NDEBUG
+    printf("listen(): " PRERF, PREAR(errno));
+    #endif
     goto out;
   }
 
@@ -348,9 +369,12 @@ static int init_socket(struct tcp_state *state)
     goto out;
   }
 
+  #ifndef NDEBUG
   printf("Listening on %s:%u...\n", bind_addr, bind_port);
+  #endif
   state->tcp_fd = tcp_fd;
   return 0;
+
 out:
   close(tcp_fd);
   return ret;
@@ -358,8 +382,8 @@ out:
 
 static void init_state(struct tcp_state *state)
 {
-  const size_t client_slot_num = sizeof(state->clients) / sizeof(*state->clients);
-  const uint16_t client_map_num = sizeof(state->client_map) / sizeof(*state->client_map);
+  const size_t client_slot_num = array_size(state->clients);
+  const uint16_t client_map_num = array_size(state->client_map);
 
   for (size_t i = 0; i < client_slot_num; i++) {
     state->clients[i].is_used = false;
