@@ -39,7 +39,6 @@ struct tcp_state {
   uint32_t            client_map[10000];
 };
 
-
 static int my_epoll_add(int epoll_fd, int fd, uint32_t events)
 {
   int err;
@@ -58,8 +57,6 @@ static int my_epoll_add(int epoll_fd, int fd, uint32_t events)
   return 0;
 }
 
-
-
 static int my_epoll_delete(int epoll_fd, int fd)
 {
   int err;
@@ -71,7 +68,6 @@ static int my_epoll_delete(int epoll_fd, int fd)
   }
   return 0;
 }
-
 
 static const char *convert_addr_ntop(struct sockaddr_in *addr, char *src_ip_buf)
 {
@@ -90,7 +86,6 @@ static const char *convert_addr_ntop(struct sockaddr_in *addr, char *src_ip_buf)
   return ret;
 }
 
-
 static int accept_new_client(int tcp_fd, struct tcp_state *state)
 {
   int err;
@@ -101,7 +96,6 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state)
   const char *src_ip;
   char src_ip_buf[sizeof("xxx.xxx.xxx.xxx")];
   const size_t client_slot_num = sizeof(state->clients) / sizeof(*state->clients);
-
 
   memset(&addr, 0, sizeof(addr));
   client_fd = accept(tcp_fd, (struct sockaddr *)&addr, &addr_len);
@@ -121,7 +115,6 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state)
     printf("Cannot parse source address\n");
     goto out_close;
   }
-
 
   /*
    * Find unused client slot.
@@ -162,12 +155,10 @@ static int accept_new_client(int tcp_fd, struct tcp_state *state)
   }
   printf("Sorry, can't accept more client at the moment, slot is full\n");
 
-
 out_close:
   close(client_fd);
   return 0;
 }
-
 
 static void handle_client_event(int client_fd, uint32_t revents,
                     struct tcp_state *state)
@@ -199,7 +190,6 @@ static void handle_client_event(int client_fd, uint32_t revents,
     goto close_conn;
   }
 
-
   /*
    * Safe printing
    */
@@ -212,7 +202,6 @@ static void handle_client_event(int client_fd, uint32_t revents,
        buffer);
   return;
 
-
 close_conn:
   printf("Client %s:%u has closed its connection\n", client->src_ip,
        client->src_port);
@@ -221,7 +210,6 @@ close_conn:
   client->is_used = false;
   return;
 }
-
 
 static int event_loop(struct tcp_state *state)
 {
@@ -244,7 +232,6 @@ static int event_loop(struct tcp_state *state)
      */
     epoll_ret = epoll_wait(epoll_fd, events, maxevents, timeout);
 
-
     if (epoll_ret == 0) {
       /*
        *`epoll_wait` reached its timeout
@@ -252,7 +239,6 @@ static int event_loop(struct tcp_state *state)
       printf("I don't see any event within %d milliseconds\n", timeout);
       continue;
     }
-
 
     if (epoll_ret == -1) {
       err = errno;
@@ -266,7 +252,6 @@ static int event_loop(struct tcp_state *state)
       printf("epoll_wait(): " PRERF, PREAR(err));
       break;
     }
-
 
     for (int i = 0; i < epoll_ret; i++) {
       int fd = events[i].data.fd;
@@ -293,7 +278,6 @@ out:
   return ret;
 }
 
-
 static int init_epoll(struct tcp_state *state)
 {
   int err;
@@ -312,7 +296,6 @@ static int init_epoll(struct tcp_state *state)
   state->epoll_fd = epoll_fd;
   return 0;
 }
-
 
 static int init_socket(struct tcp_state *state)
 {
@@ -373,7 +356,6 @@ out:
   return ret;
 }
 
-
 static void init_state(struct tcp_state *state)
 {
   const size_t client_slot_num = sizeof(state->clients) / sizeof(*state->clients);
@@ -389,7 +371,6 @@ static void init_state(struct tcp_state *state)
   }
 }
 
-
 int main(void)
 {
   int ret;
@@ -401,11 +382,9 @@ int main(void)
   if (ret != 0)
     goto out;
 
-
   ret = init_socket(&state);
   if (ret != 0)
     goto out;
-
 
   state.stop = false;
 
