@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdbool.h>
+#include <netdb.h>
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
@@ -314,38 +315,71 @@ static int init_epoll(struct tcp_state *state)
   return 0;
 }
 
-static int init_socket(struct tcp_state *state)
+static int create_socket(
+  const char *host, uint16_t port_num, int flags,
+  int (*check)(int, const struct sockaddr *, socklen_t)
+) {
+  struct addrinfo hints, *results, *rp;
+  int sock = -1, reuse = 1;
+  char port[8] = {0};
+
+  if (snprintf(port, sizeof(port) - 1, "%d", port_num) <= 0) {
+    return -1;
+  }
+
+  memset(&hints, 0, sizeof(struct addrinfo));
+  hints.ai_flags = AI_PASSIVE;
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  if (getaddrinfo(host, port, &hints, &results)) {
+    #ifndef NDEBUG
+    fprintf(stderr, "getaddrinfo failed\n");
+    #endif
+    return -1;
+  }
+
+  for (rp = results; rp != NULL; rp = rp->ai_next) {
+    if (flags != -1)
+      sock = socket(rp->ai_family, rp->ai_socktype | flags, rp->ai_protocol);
+    else
+      sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+    if (sock < 0) continue;
+    if (setsockopt(
+      sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)
+    )) {
+      close(sock);
+      sock = -1;
+      continue;
+    }
+    if (check(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
+      break;
+    }
+    close(sock);
+    sock = -1;
+  }
+
+  freeaddrinfo(results);
+  if (rp == NULL) return -1;
+  return sock;
+}
+
+static int init_server_socket(struct tcp_state *state)
 {
   int ret;
   int tcp_fd = -1;
-  struct sockaddr_in addr;
-  socklen_t addr_len = sizeof(addr);
   const char *bind_addr = "0.0.0.0";
   uint16_t bind_port = 1234;
 
   #ifndef NDEBUG
   printf("Creating TCP socket...\n");
   #endif
-  tcp_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+  tcp_fd = create_socket(bind_addr, bind_port, SOCK_NONBLOCK, bind);
   if (tcp_fd < 0) {
     #ifndef NDEBUG
     printf("socket(): " PRERF, PREAR(errno));
     #endif
     return -1;
-  }
-
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(bind_port);
-  addr.sin_addr.s_addr = inet_addr(bind_addr);
-
-  ret = bind(tcp_fd, (struct sockaddr *)&addr, addr_len);
-  if (ret < 0) {
-    ret = -1;
-    #ifndef NDEBUG
-    printf("bind(): " PRERF, PREAR(errno));
-    #endif
-    goto out;
   }
 
   ret = listen(tcp_fd, 10);
@@ -406,7 +440,7 @@ int main(void)
   if (ret != 0)
     goto out;
 
-  ret = init_socket(&state);
+  ret = init_server_socket(&state);
   if (ret != 0)
     goto out;
 
