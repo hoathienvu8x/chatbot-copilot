@@ -11,7 +11,7 @@
 #include <pthread.h>
 #include <time.h>
 
-#define MAX_EVENTS 10
+#define MAX_EVENTS 10 // Turn off when client mode
 #define PORT 8080
 #define BUFFER_SIZE 2048
 #define PERIODIC_MESSAGE_INTERVAL 5 // seconds
@@ -55,6 +55,8 @@ typedef void (*data_callback_t)(int client_sock, const uint8_t * data, size_t le
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 client_t clients[FD_SETSIZE];
 int client_count = 0;
+// pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER; // for client mode
+// client_t client;
 
 void set_non_blocking(int sock) {
   int flags = fcntl(sock, F_GETFL, 0);
@@ -345,6 +347,26 @@ void handle_websocket_handshake(int client_sock, const char *client_key) {
   }
 }
 
+// For client mode
+void perform_websocket_handshake(int client_sock, const char *host, const char *path) {
+  char request[BUFFER_SIZE];
+  const char *websocket_key = "dGhlIHNhbXBsZSBub25jZQ=="; // example key (base64 of "the sample nonce")
+  snprintf(
+    request, sizeof(request),
+    "GET %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Key: %s\r\n"
+    "Sec-WebSocket-Version: 13\r\n\r\n",
+    path, host, websocket_key
+  );
+
+  if (send(client_sock, request, strlen(request), 0) < 0) {
+    perror("send");
+  }
+}
+
 void append_to_message_buffer(client_t *client, const uint8_t *data, size_t length) {
   client->message_buffer = realloc(client->message_buffer, client->message_length + length);
   memcpy(client->message_buffer + client->message_length, data, length);
@@ -547,6 +569,44 @@ void handle_events(
   }
 }
 
+// For client
+void client_handle_events(
+  int epoll_fd, struct epoll_event *events, int num_events,
+  websocket_callback_t on_open, data_callback_t on_data,
+  websocket_callback_t on_close, websocket_callback_t on_ping,
+  websocket_callback_t on_pong
+) {
+  for (int i = 0; i < num_events; i++) {
+    if (events[i].data.fd == client.fd) {
+      uint8_t buffer[BUFFER_SIZE];
+      ssize_t bytes_read = read(client.fd, buffer, sizeof(buffer));
+
+      if (bytes_read == -1) {
+        if (errno != EAGAIN) {
+          perror("read");
+          close(client.fd);
+          on_close(client.fd);
+        }
+        continue;
+      } else if (bytes_read == 0) {
+        // Connection closed by server
+        close(client.fd);
+        on_close(client.fd);
+        continue;
+      }
+
+      if (!client.is_handshaked) {
+        // Assume handshake is successful for simplicity
+        client.is_handshaked = 1;
+        on_open(client.fd);
+      } else {
+        // Handle WebSocket frame
+        parse_websocket_frame(&client, buffer, bytes_read, on_data, on_ping, on_pong);
+      }
+    }
+  }
+}
+
 // Example callback functions
 void on_open(int client_sock) {
   printf("Client %d connected\n", client_sock);
@@ -607,6 +667,25 @@ void *send_periodic_message(void *arg) {
     }
     pthread_mutex_unlock(&clients_mutex);
   }
+  return NULL;
+}
+
+void *client_send_periodic_message(void *arg) {
+  while (1) {
+    sleep(PERIODIC_MESSAGE_INTERVAL);
+
+    pthread_mutex_lock(&client_mutex);
+    if (client.is_handshaked) {
+      const char *message = "Periodic message";
+      uint8_t frame[2 + strlen(message)];
+      frame[0] = 0x81; // FIN + text frame
+      frame[1] = strlen(message);
+      memcpy(frame + 2, message, strlen(message));
+      send(client.fd, frame, sizeof(frame), 0);
+    }
+    pthread_mutex_unlock(&client_mutex);
+  }
+
   return NULL;
 }
 
@@ -702,4 +781,80 @@ int main() {
   close(listen_sock);
   close(epoll_fd);
   return 0;
+}
+
+int main() {
+    const char *host = "echo.websocket.org";
+    const char *path = "/";
+    int port = 80;
+
+    struct hostent *server = gethostbyname(host);
+    if (server == NULL) {
+        fprintf(stderr, "ERROR, no such host\n");
+        exit(1);
+    }
+
+    client.fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client.fd == -1) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    struct sockaddr_in server_addr;
+    bzero((char *)&server_addr, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    bcopy((char *)server->h_addr, (char *)&server_addr.sin_addr.s_addr, server->h_length);
+    server_addr.sin_port = htons(port);
+
+    if (connect(client.fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        close(client.fd);
+        exit(EXIT_FAILURE);
+    }
+
+    set_non_blocking(client.fd);
+
+    client.is_handshaked = 0;
+    client.message_buffer = NULL;
+    client.message_length = 0;
+
+    perform_websocket_handshake(client.fd, host, path);
+
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        close(client.fd);
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET;
+    event.data.fd = client.fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.fd, &event) == -1) {
+        perror("epoll_ctl: client_sock");
+        close(client.fd);
+        close(epoll_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event events[10];
+
+    pthread_t periodic_thread;
+    pthread_create(&periodic_thread, NULL, send_periodic_message, NULL);
+
+    while (1) {
+        int num_events = epoll_wait(epoll_fd, events, 10, -1);
+        if (num_events == -1) {
+            perror("epoll_wait");
+            close(client.fd);
+            close(epoll_fd);
+            exit(EXIT_FAILURE);
+        }
+
+        handle_events(epoll_fd, events, num_events, on_open, on_data, on_close, on_ping, on_pong);
+    }
+
+    close(client.fd);
+    close(epoll_fd);
+    return 0;
 }
