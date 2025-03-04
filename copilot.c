@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <ctype.h>
+#include <pthread.h>
 #include <time.h>
 
 #define MAX_EVENTS 10
@@ -31,11 +32,17 @@ typedef struct {
 typedef struct {
   int fd;
   int is_handshaked;
+  uint8_t *message_buffer;
+  size_t message_length;
+  uint8_t continuation_opcode;
 } client_t;
 
-typedef void (*websocket_callback_t)(int);
+typedef void (*websocket_callback_t)(int client_sock);
+typedef void (*data_callback_t)(int client_sock, const uint8_t * data, size_t length);
 
-typedef void (*data_callback_t)(int, const uint8_t *, size_t);
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+client_t clients[FD_SETSIZE];
+int client_count = 0;
 
 void set_non_blocking(int sock) {
   int flags = fcntl(sock, F_GETFL, 0);
@@ -326,6 +333,12 @@ void handle_websocket_handshake(int client_sock, const char *client_key) {
   }
 }
 
+void append_to_message_buffer(client_t *client, const uint8_t *data, size_t length) {
+  client->message_buffer = realloc(client->message_buffer, client->message_length + length);
+  memcpy(client->message_buffer + client->message_length, data, length);
+  client->message_length += length;
+}
+
 void parse_websocket_frame(
   int client_sock, const uint8_t *buffer, size_t length,
   data_callback_t data_callback, websocket_callback_t on_ping,
@@ -336,7 +349,22 @@ void parse_websocket_frame(
     return;
   }
 
-  // uint8_t fin = (buffer[0] & 0x80) >> 7;
+  pthread_mutex_lock(&clients_mutex);
+  client_t *client = NULL;
+  for (int i = 0; i < client_count; i++) {
+    if (clients[i].fd == client_sock) {
+      client = &clients[i];
+      break;
+    }
+  }
+  pthread_mutex_unlock(&clients_mutex);
+
+  if (client == NULL) {
+    fprintf(stderr, "Client not found\n");
+    return;
+  }
+
+  uint8_t fin = (buffer[0] & 0x80) >> 7;
   uint8_t opcode = buffer[0] & 0x0F;
   uint8_t masked = (buffer[1] & 0x80) >> 7;
   uint64_t payload_len = buffer[1] & 0x7F;
@@ -387,9 +415,23 @@ void parse_websocket_frame(
   }
 
   switch (opcode) {
+    case 0x0: // Continuation frame
+      append_to_message_buffer(client, payload_data, payload_len);
+      if (fin) {
+          data_callback(client_sock, client->message_buffer, client->message_length);
+          free(client->message_buffer);
+          client->message_buffer = NULL;
+          client->message_length = 0;
+      }
+      break;
     case 0x1: // Text frame
     case 0x2: // Binary frame
-      data_callback(client_sock, payload_data, payload_len);
+      if (fin) {
+        data_callback(client_sock, payload_data, payload_len);
+      } else {
+        client->continuation_opcode = opcode;
+        append_to_message_buffer(client, payload_data, payload_len);
+      }
       break;
     case 0x9: // Ping frame
       on_ping(client_sock);
@@ -407,8 +449,7 @@ void parse_websocket_frame(
 
 void handle_events(
   int epoll_fd, struct epoll_event *events, int num_events,
-  int listen_sock, client_t *clients, int *client_count,
-  websocket_callback_t on_open, data_callback_t on_data,
+  int listen_sock, websocket_callback_t on_open, data_callback_t on_data,
   websocket_callback_t on_close, websocket_callback_t on_ping,
   websocket_callback_t on_pong
 ) {
@@ -434,9 +475,13 @@ void handle_events(
         continue;
       }
 
-      clients[*client_count].fd = client_sock;
-      clients[*client_count].is_handshaked = 0;
-      (*client_count)++;
+      pthread_mutex_lock(&clients_mutex);
+      clients[client_count].fd = client_sock;
+      clients[client_count].is_handshaked = 0;
+      clients[client_count].message_buffer = NULL;
+      clients[client_count].message_length = 0;
+      client_count++;
+      pthread_mutex_unlock(&clients_mutex);
 
       on_open(client_sock);
     } else {
@@ -452,12 +497,15 @@ void handle_events(
         continue;
       } else if (bytes_read == 0) {
         // Connection closed by client
-        for (int j = 0; j < *client_count; j++) {
+        pthread_mutex_lock(&clients_mutex);
+        for (int j = 0; j < client_count; j++) {
           if (clients[j].fd == client_sock) {
-            clients[j] = clients[--(*client_count)];
+            free(clients[j].message_buffer);
+            clients[j] = clients[--client_count];
             break;
           }
         }
+        pthread_mutex_unlock(&clients_mutex);
         close(client_sock);
         on_close(client_sock);
         continue;
@@ -471,12 +519,14 @@ void handle_events(
         *end_key = '\0';
         handle_websocket_handshake(client_sock, client_key);
 
-        for (int j = 0; j < *client_count; j++) {
+        pthread_mutex_lock(&clients_mutex);
+        for (int j = 0; j < client_count; j++) {
           if (clients[j].fd == client_sock) {
             clients[j].is_handshaked = 1;
             break;
           }
         }
+        pthread_mutex_unlock(&clients_mutex);
       } else {
         // Handle WebSocket frame
         parse_websocket_frame(client_sock, buffer, bytes_read, on_data, on_ping, on_pong);
@@ -521,18 +571,6 @@ void on_pong(int client_sock) {
   printf("Received pong from client %d\n", client_sock);
 }
 
-void send_periodic_message(
-  int epoll_fd, client_t *clients, int client_count,
-  websocket_callback_t on_periodic
-) {
-  (void)epoll_fd;
-  for (int i = 0; i < client_count; i++) {
-    if (clients[i].is_handshaked) {
-      on_periodic(clients[i].fd);
-    }
-  }
-}
-
 void on_periodic(int client_sock) {
   const char *message = "Periodic message";
   uint8_t frame[2 + strlen(message)];
@@ -542,6 +580,22 @@ void on_periodic(int client_sock) {
   if (write(client_sock, frame, sizeof(frame)) < 0) {
     perror("write");
   }
+}
+
+void *send_periodic_message(void *arg) {
+  (void)arg;
+  while (1) {
+    sleep(PERIODIC_MESSAGE_INTERVAL);
+
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < client_count; i++) {
+      if (clients[i].is_handshaked) {
+        on_periodic(clients[i].fd);
+      }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+  }
+  return NULL;
 }
 
 int main() {
@@ -566,13 +620,12 @@ int main() {
   }
 
   struct epoll_event events[MAX_EVENTS];
-  client_t clients[FD_SETSIZE];
-  int client_count = 0;
 
-  time_t last_periodic_message_time = time(NULL);
+  pthread_t periodic_thread;
+  pthread_create(&periodic_thread, NULL, send_periodic_message, NULL);
 
   while (1) {
-    int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+    int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
     if (num_events == -1) {
       perror("epoll_wait");
       close(listen_sock);
@@ -580,16 +633,7 @@ int main() {
       exit(EXIT_FAILURE);
     }
 
-    handle_events(
-      epoll_fd, events, num_events, listen_sock, clients, &client_count,
-      on_open, on_data, on_close, on_ping, on_pong
-    );
-
-    time_t current_time = time(NULL);
-    if (current_time - last_periodic_message_time >= PERIODIC_MESSAGE_INTERVAL) {
-      send_periodic_message(epoll_fd, clients, client_count, on_periodic);
-      last_periodic_message_time = current_time;
-    }
+    handle_events(epoll_fd, events, num_events, listen_sock, on_open, on_data, on_close, on_ping, on_pong);
   }
 
   close(listen_sock);
