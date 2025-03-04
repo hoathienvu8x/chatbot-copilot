@@ -322,6 +322,14 @@ int base64_decode(const char *input, unsigned char *output) {
   return j;
 }
 
+void generate_random_nonce_with_length(uint8_t *nonce, size_t length) {
+  for (size_t i = 0; i < length; ++i) {
+    nonce[i] = rand() % 256;
+  }
+}
+
+#define generate_random_nonce(a) generate_random_nonce_with_length(a, 16)
+
 void handle_websocket_handshake(int client_sock, const char *client_key) {
   char response[BUFFER_SIZE] = {0};
   const char *websocket_magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -347,7 +355,7 @@ void handle_websocket_handshake(int client_sock, const char *client_key) {
   }
 }
 
-// For client mode
+/* For client mode
 void perform_websocket_handshake(int client_sock, const char *host, const char *path) {
   char request[BUFFER_SIZE];
   const char *websocket_key = "dGhlIHNhbXBsZSBub25jZQ=="; // example key (base64 of "the sample nonce")
@@ -366,7 +374,7 @@ void perform_websocket_handshake(int client_sock, const char *host, const char *
     perror("send");
   }
 }
-
+*/
 void append_to_message_buffer(client_t *client, const uint8_t *data, size_t length) {
   client->message_buffer = realloc(client->message_buffer, client->message_length + length);
   memcpy(client->message_buffer + client->message_length, data, length);
@@ -569,7 +577,7 @@ void handle_events(
   }
 }
 
-// For client
+/* For client
 void client_handle_events(
   int epoll_fd, struct epoll_event *events, int num_events,
   websocket_callback_t on_open, data_callback_t on_data,
@@ -605,7 +613,7 @@ void client_handle_events(
       }
     }
   }
-}
+} */
 
 // Example callback functions
 void on_open(int client_sock) {
@@ -669,7 +677,7 @@ void *send_periodic_message(void *arg) {
   }
   return NULL;
 }
-
+/*
 void *client_send_periodic_message(void *arg) {
   while (1) {
     sleep(PERIODIC_MESSAGE_INTERVAL);
@@ -687,7 +695,7 @@ void *client_send_periodic_message(void *arg) {
   }
 
   return NULL;
-}
+}*/
 
 void create_websocket_frame(
   const uint8_t *message, size_t message_len, uint8_t **frames,
@@ -737,10 +745,20 @@ void create_websocket_frame(
 }
 
 void free_websocket_frames(uint8_t *frames) {
-    free(frames);
+  free(frames);
 }
 
 int main() {
+  srand((unsigned int) time(NULL));
+  uint8_t nonce[16];  // WebSocket nonces are typically 16 bytes long
+  generate_random_nonce(nonce);
+  char base64_nonce[25];
+  base64_encode(nonce, sizeof(nonce), base64_nonce);
+  printf("Generated WebSocket Nonce Key: %s\n", base64_nonce);
+  return 0;
+}
+
+int main0() {
   int listen_sock = create_listen_socket();
   set_non_blocking(listen_sock);
 
@@ -782,7 +800,7 @@ int main() {
   close(epoll_fd);
   return 0;
 }
-
+/*
 int main() {
     const char *host = "echo.websocket.org";
     const char *path = "/";
@@ -858,3 +876,4 @@ int main() {
     close(epoll_fd);
     return 0;
 }
+*/
