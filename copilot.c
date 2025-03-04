@@ -18,6 +18,18 @@
 
 #define SHA1_BLOCK_SIZE 20
 
+#define FIN_BIT 0x80
+#define RSV1_BIT 0x40
+#define RSV2_BIT 0x20
+#define RSV3_BIT 0x10
+#define MASK_BIT 0x80
+
+#define WS_FR_OP_CONT 0x00
+#define WS_FR_OP_TXT 0x01
+#define WS_FR_OP_BIN 0x2
+#define WS_FR_OP_PING 0x9
+#define WS_FR_OP_PONG 0xA
+
 static const char base64_table[] =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -415,7 +427,7 @@ void parse_websocket_frame(
   }
 
   switch (opcode) {
-    case 0x0: // Continuation frame
+    case WS_FR_OP_CONT: // Continuation frame
       append_to_message_buffer(client, payload_data, payload_len);
       if (fin) {
           data_callback(client_sock, client->message_buffer, client->message_length);
@@ -424,8 +436,8 @@ void parse_websocket_frame(
           client->message_length = 0;
       }
       break;
-    case 0x1: // Text frame
-    case 0x2: // Binary frame
+    case WS_FR_OP_TXT: // Text frame
+    case WS_FR_OP_BIN: // Binary frame
       if (fin) {
         data_callback(client_sock, payload_data, payload_len);
       } else {
@@ -433,10 +445,10 @@ void parse_websocket_frame(
         append_to_message_buffer(client, payload_data, payload_len);
       }
       break;
-    case 0x9: // Ping frame
+    case WS_FR_OP_PING: // Ping frame
       on_ping(client_sock);
       break;
-    case 0xA: // Pong frame
+    case WS_FR_OP_PONG: // Pong frame
       on_pong(client_sock);
       break;
     default:
@@ -596,6 +608,57 @@ void *send_periodic_message(void *arg) {
     pthread_mutex_unlock(&clients_mutex);
   }
   return NULL;
+}
+
+void create_websocket_frame(
+  const uint8_t *message, size_t message_len, uint8_t **frames,
+  size_t *frames_len, size_t chunk_size
+) {
+  size_t num_frames = (message_len + chunk_size - 1) / chunk_size;
+  *frames_len = 0;
+
+  // Allocate memory for all frames
+  *frames = (uint8_t *)malloc(num_frames * (chunk_size + 10)); // Allocating worst case scenario for each frame
+
+  size_t offset = 0;
+  for (size_t i = 0; i < num_frames; i++) {
+    uint8_t fin = (i == num_frames - 1) ? FIN_BIT : 0;
+    uint8_t opcode = (i == 0) ? WS_FR_OP_TXT : WS_FR_OP_CONT;
+    size_t frame_len = (i == num_frames - 1) ? (message_len - offset) : chunk_size;
+    size_t header_len;
+
+    if (frame_len <= 125) {
+      header_len = 2;
+    } else if (frame_len <= 65535) {
+      header_len = 4;
+    } else {
+      header_len = 10;
+    }
+
+    (*frames)[*frames_len] = fin | opcode;
+
+    if (frame_len <= 125) {
+      (*frames)[*frames_len + 1] = frame_len;
+    } else if (frame_len <= 65535) {
+      (*frames)[*frames_len + 1] = 126;
+      (*frames)[*frames_len + 2] = (frame_len >> 8) & 0xFF;
+      (*frames)[*frames_len + 3] = frame_len & 0xFF;
+    } else {
+      (*frames)[*frames_len + 1] = 127;
+      for (int j = 0; j < 8; ++j) {
+        (*frames)[*frames_len + 9 - j] = frame_len & 0xFF;
+        frame_len >>= 8;
+      }
+    }
+
+    memcpy(*frames + *frames_len + header_len, message + offset, frame_len);
+    *frames_len += header_len + frame_len;
+    offset += frame_len;
+  }
+}
+
+void free_websocket_frames(uint8_t *frames) {
+    free(frames);
 }
 
 int main() {
