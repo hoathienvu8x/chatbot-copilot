@@ -9,7 +9,7 @@ endif
 CFLAGS += -std=gnu99 -Wall -Wextra -Werror -pedantic
 RM = rm -rf
 
-OBJECTS = 
+OBJECTS = b64.o ws.o
 OBJECTS := $(addprefix objects/,$(OBJECTS))
 EXECUTABLE = demo
 
