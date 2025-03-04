@@ -1,1 +1,70 @@
 https://c-pointers.com/lsp/sockets/ipv4_af_inet_tcp/epoll/epoll.html
+
+https://cboard.cprogramming.com/c-programming/172449-how-use-recv-get-all-data-non-blocking-sockets-post1266273.html#post1266273
+So you start with this.
+
+Code:
+
+```c
+if (FD_ISSET(i, &read_fds_list)) {
+  // retrieve message
+  buffused = 0;
+  int valid = read_message(i, buffer,MAX_BUFFER-1,&buffused);
+  if ( buffused > 0 ) {
+    buffer[buffused] = '\0';
+    printf("%s\n", buffer);
+    // or just this by itself
+    // printf("%.*s\n", buffused, buffer);
+  }
+  if ( valid < 0 ) {
+    // error
+  } else if ( valid == 0 ) {
+    // remote disconnected
+  }
+}
+```
+
+Not all socket streams are printable data, so a lower level routine doesn't
+care about adding `\0` to the buffer. Consider it to be essentially `recv()`
+with a buffer and `EAGAIN` handling.
+
+Code:
+
+```c
+int read_message ( int sock, char *buff, size_t bufflen, size_t *buffused ) {
+  int result = 0;
+  *buffused = 0;
+   
+  // Loop until the buffer is full, or a recv result
+  // indicates there is a problem of one sort or another
+  while ( *buffused < bufflen ) {
+    int n = recv(sock, &buff[*buffused], 1, 0);
+    if ( n > 0 ) {
+      // success
+      ++(*buffused);
+      result = 1;
+    } else if ( n < 0 ) {
+      if ( errno == EAGAIN || errno == EWOULDBLOCK ) {
+        // This is expected on a non-blocking socket,
+        // so just return with what's available at the
+        // moment.
+        result = 1;
+      } else {
+        // Everything else is a hard error.
+        // Do something with it in the caller.
+        result = -errno;
+      }
+      break;
+    } else {  // n == 0
+      // closed
+      result = 0;
+      break;
+    }
+  }
+ 
+  return result;
+}
+```
+
+If you want to add framing (eg `\n`) and `\0` termination to it, then that's
+an easy exercise.

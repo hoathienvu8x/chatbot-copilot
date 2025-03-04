@@ -28,10 +28,19 @@ endif
 	@$(CC) objects/demo.o $(OBJECTS) -o $@ $(LDFLAGS)
 	@$(RM) objects/demo.o
 
+copilot: objects/copilot.o $(OBJECTS)
+ifeq ($(build),release)
+	@echo "Build release '$@' executable ..."
+else
+	@echo "Build '$@' executable ..."
+endif
+	@$(CC) objects/copilot.o $(OBJECTS) -o $@ $(LDFLAGS)
+	@$(RM) objects/copilot.o
+
 objects/%.o: %.c
 	@echo "Build '$@' object ..."
 	@$(CC) -c $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
 	@echo "Cleanup ..."
-	@$(RM) $(OBJECTS) $(EXECUTABLE)
+	@$(RM) $(OBJECTS) $(EXECUTABLE) copilot
