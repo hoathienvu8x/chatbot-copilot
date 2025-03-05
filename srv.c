@@ -25,21 +25,38 @@
 #define WS_FR_OP_PING 0x9
 #define WS_FR_OP_PONG 0xA
 
-typedef struct {
+typedef struct client_t client_t;
+typedef struct server_t server_t;
+
+struct client_t {
   int fd;
   int is_handshaked;
+  server_t *srv;
   uint8_t *message_buffer;
   size_t message_length;
   uint8_t continuation_opcode;
-} client_t;
+};
 
-typedef void (*websocket_callback_t)(int client_sock);
+struct event_callback_t {
+  void (*on_open)(client_t *client);
+  void (*on_close)(client_t *client);
+  void (*on_data)(
+    client_t *client, const uint8_t opcode,
+    const uint8_t *data, size_t length
+  );
+  void (*on_ping)(client_t *client);
+  void (*on_pong)(client_t *client);
+  void (*on_periodic)(server_t *server);
+};
 
-typedef void (*data_callback_t)(int client_sock, const uint8_t *data, size_t length);
-
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
-client_t clients[FD_SETSIZE];
-int client_count = 0;
+struct server_t {
+  int fd;
+  int epoll_fd;
+  pthread_mutex_t clients_mutex;
+  int client_count;
+  client_t clients[FD_SETSIZE];
+  struct event_callback_t events;
+};
 
 void set_non_blocking(int sock) {
   int flags = fcntl(sock, F_GETFL, 0);
@@ -113,24 +130,12 @@ void append_to_message_buffer(client_t *client, const uint8_t *data, size_t leng
 }
 
 void parse_websocket_frame(
-  int client_sock, const uint8_t *buffer, size_t length,
-  data_callback_t data_callback, websocket_callback_t on_ping,
-  websocket_callback_t on_pong, websocket_callback_t on_close
+  client_t *client, const uint8_t *buffer, size_t length
 ) {
   if (length < 2) {
     fprintf(stderr, "Frame too short\n");
     return;
   }
-
-  pthread_mutex_lock(&clients_mutex);
-  client_t *client = NULL;
-  for (int i = 0; i < client_count; i++) {
-    if (clients[i].fd == client_sock) {
-      client = &clients[i];
-      break;
-    }
-  }
-  pthread_mutex_unlock(&clients_mutex);
 
   if (client == NULL) {
     fprintf(stderr, "Client not found\n");
@@ -187,11 +192,18 @@ void parse_websocket_frame(
     }
   }
 
+  server_t *srv = client->srv;
+
   switch (opcode) {
     case WS_FR_OP_CONT: // Continuation frame
       append_to_message_buffer(client, payload_data, payload_len);
       if (fin) {
-        data_callback(client_sock, client->message_buffer, client->message_length);
+        if (srv && *srv->events.on_data) {
+          (*srv->events.on_data)(
+            client, client->continuation_opcode,
+            client->message_buffer, client->message_length
+          );
+        }
         free(client->message_buffer);
         client->message_buffer = NULL;
         client->message_length = 0;
@@ -200,7 +212,11 @@ void parse_websocket_frame(
     case WS_FR_OP_TXT: // Text frame
     case WS_FR_OP_BIN: // Binary frame
       if (fin) {
-        data_callback(client_sock, payload_data, payload_len);
+        if (srv && *srv->events.on_data) {
+          (*srv->events.on_data)(
+            client, opcode, payload_data, payload_len
+          );
+        }
       } else {
         client->continuation_opcode = opcode;
         append_to_message_buffer(client, payload_data, payload_len);
@@ -209,24 +225,38 @@ void parse_websocket_frame(
     case WS_FR_OP_CLSE: // Close frame
       printf("Received close frame from client %d\n", client->fd);
       // Connection closed by client
-      pthread_mutex_lock(&clients_mutex);
-      for (int j = 0; j < client_count; j++) {
-        if (clients[j].fd == client_sock) {
-          free(clients[j].message_buffer);
-          clients[j] = clients[--client_count];
-          break;
+      if (srv) {
+        pthread_mutex_lock(&srv->clients_mutex);
+        for (int j = 0; j < srv->client_count; j++) {
+          if (srv->clients[j].fd == client->fd) {
+            free(srv->clients[j].message_buffer);
+            srv->clients[j] = srv->clients[--srv->client_count];
+            break;
+          }
         }
+        pthread_mutex_unlock(&srv->clients_mutex);
       }
-      pthread_mutex_unlock(&clients_mutex);
-      close(client_sock);
-      on_close(client_sock);
+      if (srv && *srv->events.on_close) {
+        (*srv->events.on_close)(client);
+      }
       close(client->fd);
       break;
     case WS_FR_OP_PING: // Ping frame
-      on_ping(client_sock);
+      if (srv && *srv->events.on_ping) {
+        (*srv->events.on_ping)(client);
+      } else {
+        uint8_t frame[2];
+        frame[0] = FIN_BIT | WS_FR_OP_PONG; // FIN + pong frame
+        frame[1] = 0x00; // No payload
+        if (write(client->fd, frame, sizeof(frame)) < 0) {
+          perror("write on ping");
+        }
+      }
       break;
     case WS_FR_OP_PONG: // Pong frame
-      on_pong(client_sock);
+      if (srv && *srv->events.on_pong) {
+        (*srv->events.on_pong)(client);
+      }
       break;
     default:
       fprintf(stderr, "Unknown opcode: %u\n", opcode);
@@ -237,17 +267,14 @@ void parse_websocket_frame(
 }
 
 void handle_events(
-  int epoll_fd, struct epoll_event *events, int num_events, int listen_sock,
-  websocket_callback_t on_open, data_callback_t on_data,
-  websocket_callback_t on_close, websocket_callback_t on_ping,
-  websocket_callback_t on_pong
+  server_t *srv , struct epoll_event *events, int num_events
 ) {
   for (int i = 0; i < num_events; i++) {
-    if (events[i].data.fd == listen_sock) {
+    if (events[i].data.fd == srv->fd) {
       // Accept new connection
       struct sockaddr_in client_addr;
       socklen_t client_addr_len = sizeof(client_addr);
-      int client_sock = accept(listen_sock, (struct sockaddr*)&client_addr, &client_addr_len);
+      int client_sock = accept(srv->fd, (struct sockaddr*)&client_addr, &client_addr_len);
       if (client_sock == -1) {
         perror("accept");
         continue;
@@ -258,21 +285,24 @@ void handle_events(
       struct epoll_event event;
       event.events = EPOLLIN | EPOLLET;
       event.data.fd = client_sock;
-      if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
+      if (epoll_ctl(srv->epoll_fd, EPOLL_CTL_ADD, client_sock, &event) == -1) {
         perror("epoll_ctl: client_sock");
         close(client_sock);
         continue;
       }
 
-      pthread_mutex_lock(&clients_mutex);
-      clients[client_count].fd = client_sock;
-      clients[client_count].is_handshaked = 0;
-      clients[client_count].message_buffer = NULL;
-      clients[client_count].message_length = 0;
-      client_count++;
-      pthread_mutex_unlock(&clients_mutex);
-
-      on_open(client_sock);
+      pthread_mutex_lock(&srv->clients_mutex);
+      srv->clients[srv->client_count].fd = client_sock;
+      srv->clients[srv->client_count].is_handshaked = 0;
+      srv->clients[srv->client_count].message_buffer = NULL;
+      srv->clients[srv->client_count].message_length = 0;
+      srv->clients[srv->client_count].srv = srv;
+      client_t *cli = &srv->clients[srv->client_count];
+      srv->client_count++;
+      pthread_mutex_unlock(&srv->clients_mutex);
+      if (*srv->events.on_open) {
+        (*srv->events.on_open)(cli);
+      }
     } else {
       // Handle client data
       int client_sock = events[i].data.fd;
@@ -286,17 +316,19 @@ void handle_events(
         continue;
       } else if (bytes_read == 0) {
         // Connection closed by client
-        pthread_mutex_lock(&clients_mutex);
-        for (int j = 0; j < client_count; j++) {
-          if (clients[j].fd == client_sock) {
-            free(clients[j].message_buffer);
-            clients[j] = clients[--client_count];
+        pthread_mutex_lock(&srv->clients_mutex);
+        for (int j = 0; j < srv->client_count; j++) {
+          if (srv->clients[j].fd == client_sock) {
+            free(srv->clients[j].message_buffer);
+            srv->clients[j] = srv->clients[--srv->client_count];
             break;
           }
         }
-        pthread_mutex_unlock(&clients_mutex);
+        pthread_mutex_unlock(&srv->clients_mutex);
         close(client_sock);
-        on_close(client_sock);
+        /* if(srv->events.on_close) {
+          (srv->events.on_close)(client);
+        } */
         continue;
       }
 
@@ -308,83 +340,100 @@ void handle_events(
         *end_key = '\0';
         handle_websocket_handshake(client_sock, client_key);
 
-        pthread_mutex_lock(&clients_mutex);
-        for (int j = 0; j < client_count; j++) {
-          if (clients[j].fd == client_sock) {
-            clients[j].is_handshaked = 1;
+        pthread_mutex_lock(&srv->clients_mutex);
+        for (int j = 0; j < srv->client_count; j++) {
+          if (srv->clients[j].fd == client_sock) {
+            srv->clients[j].is_handshaked = 1;
             break;
           }
         }
-        pthread_mutex_unlock(&clients_mutex);
+        pthread_mutex_unlock(&srv->clients_mutex);
       } else {
+        client_t *cli = NULL;
+        pthread_mutex_lock(&srv->clients_mutex);
+        for (int j = 0; j < srv->client_count; j++) {
+          if (srv->clients[j].fd == client_sock) {
+            cli = &srv->clients[j];
+            break;
+          }
+        }
+        pthread_mutex_unlock(&srv->clients_mutex);
         // Handle WebSocket frame
-        parse_websocket_frame(
-          client_sock, buffer, bytes_read, on_data, on_ping, on_pong, on_close
-        );
+        if (!cli) continue;
+        parse_websocket_frame(cli, buffer, bytes_read);
       }
     }
   }
 }
 
 // Example callback functions
-void on_open(int client_sock) {
-  printf("Client %d connected\n", client_sock);
+void on_open(client_t *client) {
+  printf("Client %d connected\n", client->fd);
 }
 
-void on_data(int client_sock, const uint8_t *data, size_t length) {
-  printf("Received message from client %d: %.*s\n", client_sock, (int)length, data);
+void on_data(
+  client_t *client, const uint8_t opcode, const uint8_t *data, size_t length
+) {
+  if (opcode == WS_FR_OP_TXT) {
+    printf("Received message from client %d: %.*s\n", client->fd, (int)length, data);
+  } else {
+    printf("Received message from client %d: %d bytes\n", client->fd, (int)length);
+  }
   // Echo the data back to the client
   uint8_t frame[2 + length];
   frame[0] = FIN_BIT | WS_FR_OP_TXT; // FIN + text frame
   frame[1] = length;
   memcpy(frame + 2, data, length);
-  if (write(client_sock, frame, sizeof(frame)) < 0) {
+  if (write(client->fd, frame, sizeof(frame)) < 0) {
     perror("write on data");
   }
 }
 
-void on_close(int client_sock) {
-  printf("Client %d disconnected\n", client_sock);
+void on_close(client_t *client) {
+  printf("Client %d disconnected\n", client->fd);
 }
 
-void on_ping(int client_sock) {
-  printf("Received ping from client %d\n", client_sock);
+void on_ping(client_t *client) {
+  printf("Received ping from client %d\n", client->fd);
   // Send pong response
   uint8_t frame[2];
   frame[0] = FIN_BIT | WS_FR_OP_PONG; // FIN + pong frame
   frame[1] = 0x00; // No payload
-  if (write(client_sock, frame, sizeof(frame)) < 0) {
+  if (write(client->fd, frame, sizeof(frame)) < 0) {
     perror("write on ping");
   }
 }
 
-void on_pong(int client_sock) {
-  printf("Received pong from client %d\n", client_sock);
+void on_pong(client_t *client) {
+  printf("Received pong from client %d\n", client->fd);
 }
 
-void on_periodic(int client_sock) {
-  const char *message = "Periodic message";
-  uint8_t frame[2 + strlen(message)];
-  frame[0] = FIN_BIT | WS_FR_OP_TXT; // FIN + text frame
-  frame[1] = strlen(message);
-  memcpy(frame + 2, message, strlen(message));
-  if (write(client_sock, frame, sizeof(frame)) < 0) {
-    perror("write on periodic");
+void on_periodic(server_t *srv) {
+  if (!srv) return;
+
+  pthread_mutex_lock(&srv->clients_mutex);
+  for (int i = 0; i < srv->client_count; i++) {
+    if (srv->clients[i].is_handshaked) {
+      const char *message = "Periodic message";
+      uint8_t frame[2 + strlen(message)];
+      frame[0] = FIN_BIT | WS_FR_OP_TXT; // FIN + text frame
+      frame[1] = strlen(message);
+      memcpy(frame + 2, message, strlen(message));
+      if (write(srv->clients[i].fd, frame, sizeof(frame)) < 0) {
+        perror("write on periodic");
+      }
+    }
   }
+  pthread_mutex_unlock(&srv->clients_mutex);
 }
 
 void *send_periodic_message(void *arg) {
-  (void)arg;
+  server_t *srv = (server_t *)arg;
+  if (!srv || !(*srv->events.on_periodic)) return NULL;
   while (1) {
     sleep(PERIODIC_MESSAGE_INTERVAL);
 
-    pthread_mutex_lock(&clients_mutex);
-    for (int i = 0; i < client_count; i++) {
-      if (clients[i].is_handshaked) {
-        on_periodic(clients[i].fd);
-      }
-    }
-    pthread_mutex_unlock(&clients_mutex);
+    (*srv->events.on_periodic)(srv);
   }
   return NULL;
 }
@@ -410,27 +459,41 @@ int main() {
     exit(EXIT_FAILURE);
   }
 
+  server_t srv;
+  memset(&srv, 0, sizeof(srv));
+
+  srv.fd = listen_sock;
+  srv.epoll_fd = epoll_fd;
+
+  srv.events.on_open = on_open;
+  srv.events.on_close = on_close;
+  srv.events.on_ping = on_ping;
+  srv.events.on_pong = on_pong;
+  srv.events.on_data = on_data;
+  srv.events.on_periodic = on_periodic;
+
+  if (pthread_mutex_init(&srv.clients_mutex, NULL) != 0) {
+    goto done;
+  }
+
   struct epoll_event events[MAX_EVENTS];
 
   pthread_t periodic_thread;
-  pthread_create(&periodic_thread, NULL, send_periodic_message, NULL);
+  pthread_create(&periodic_thread, NULL, send_periodic_message, &srv);
 
   while (1) {
-    int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+    int num_events = epoll_wait(srv.epoll_fd, events, MAX_EVENTS, -1);
     if (num_events == -1) {
       perror("epoll_wait");
-      close(listen_sock);
-      close(epoll_fd);
-      exit(EXIT_FAILURE);
+      break;
     }
 
-    handle_events(
-      epoll_fd, events, num_events, listen_sock, on_open,
-      on_data, on_close, on_ping, on_pong
-    );
+    handle_events(&srv, events, num_events);
   }
+  pthread_mutex_destroy(&srv.clients_mutex);
 
-  close(listen_sock);
-  close(epoll_fd);
+done:
+  close(srv.fd);
+  close(srv.epoll_fd);
   return 0;
 }
