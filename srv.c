@@ -15,9 +15,11 @@
 #define MAX_EVENTS 10
 #define PORT 8080
 #define BUFFER_SIZE 2048
+#define BUFFER_CHUNK (BUFFER_SIZE - 10)
 #define PERIODIC_MESSAGE_INTERVAL 5 // seconds
 
 #define FIN_BIT 0x80
+
 #define WS_FR_OP_CONT 0
 #define WS_FR_OP_TXT  1
 #define WS_FR_OP_BIN  2
@@ -25,12 +27,22 @@
 #define WS_FR_OP_PING 0x9
 #define WS_FR_OP_PONG 0xA
 
+#define WS_STATE_CONNECTING 0
+#define WS_STATE_OPEN       1
+#define WS_STATE_CLOSING    2
+#define WS_STATE_CLOSED     3
+
 typedef struct client_t client_t;
 typedef struct server_t server_t;
 
+struct connection_t {
+  int fd;
+  int state;
+};
+
 struct client_t {
   int fd;
-  int is_handshaked;
+  int state;
   server_t *srv;
   uint8_t *message_buffer;
   size_t message_length;
@@ -56,6 +68,7 @@ struct server_t {
   int client_count;
   client_t clients[FD_SETSIZE];
   struct event_callback_t events;
+  int is_stop;
 };
 
 void set_non_blocking(int sock) {
@@ -101,6 +114,58 @@ int create_listen_socket() {
   return listen_sock;
 }
 
+int ws_send_data(int fd, const char *data, size_t length) {
+  if (!data || length == 0) return -1;
+  return write(fd, data, length);
+}
+
+void ws_send_frame(
+  struct connection_t *conn, int opcode, const char *data, size_t length
+) {
+  if (opcode == WS_FR_OP_TXT || opcode == WS_FR_OP_BIN) {
+    if (!data || length == 0) return;
+  }
+  size_t num_frames = (length + BUFFER_CHUNK)  / BUFFER_CHUNK;
+  size_t offset = 0;
+  unsigned char buffer[BUFFER_SIZE] = {0};
+  for (size_t i = 0; i < num_frames; i++) {
+    uint8_t fin = (i == num_frames - 1) ? FIN_BIT : 0;
+    uint8_t op = i == 0 ? opcode : WS_FR_OP_CONT;
+    size_t frame_len = BUFFER_CHUNK;
+    if (i == num_frames - 1) {
+      frame_len = length - offset;
+    }
+    size_t header_len = 10;
+    if (frame_len <= 125) {
+      header_len = 2;
+    } else if (frame_len <= 65535) {
+      header_len = 4;
+    }
+    memset(buffer, 0, sizeof(buffer));
+    buffer[0] = fin | op;
+    if (frame_len <= 125) {
+      buffer[1] = frame_len;
+    } else if (frame_len <= 65535) {
+      buffer[1] = 126;
+      buffer[2] = (frame_len >> 8) & 0xff;
+      buffer[3] = frame_len & 0xff;
+    } else {
+      buffer[1] = 127;
+      size_t flen = frame_len;
+      for (size_t j = 2; j < 10; j++) {
+        buffer[j] = flen & 0xff;
+        flen >>= 8;
+      }
+    }
+    memcpy(&buffer[header_len], data + offset, frame_len);
+    offset += frame_len;
+    if (ws_send_data(conn->fd, (const char *)buffer, frame_len + header_len) <= 0) {
+      perror("write");
+      break;
+    }
+  }
+}
+
 void handle_websocket_handshake(int client_sock, const char *client_key) {
   char response[BUFFER_SIZE];
   const char *websocket_magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -118,7 +183,7 @@ void handle_websocket_handshake(int client_sock, const char *client_key) {
            "Connection: Upgrade\r\n"
            "Sec-WebSocket-Accept: %s\r\n\r\n", encoded_hash);
 
-  if (write(client_sock, response, strlen(response)) < 0) {
+  if (ws_send_data(client_sock, response, strlen(response)) < 0) {
     perror("write");
   }
 }
@@ -235,9 +300,9 @@ void parse_websocket_frame(
           }
         }
         pthread_mutex_unlock(&srv->clients_mutex);
-      }
-      if (srv && *srv->events.on_close) {
-        (*srv->events.on_close)(client);
+        if (*srv->events.on_close) {
+          (*srv->events.on_close)(client);
+        }
       }
       close(client->fd);
       break;
@@ -245,12 +310,7 @@ void parse_websocket_frame(
       if (srv && *srv->events.on_ping) {
         (*srv->events.on_ping)(client);
       } else {
-        uint8_t frame[2];
-        frame[0] = FIN_BIT | WS_FR_OP_PONG; // FIN + pong frame
-        frame[1] = 0x00; // No payload
-        if (write(client->fd, frame, sizeof(frame)) < 0) {
-          perror("write on ping");
-        }
+        ws_send_frame((struct connection_t *)client, WS_FR_OP_PONG, NULL, 0);
       }
       break;
     case WS_FR_OP_PONG: // Pong frame
@@ -293,7 +353,7 @@ void handle_events(
 
       pthread_mutex_lock(&srv->clients_mutex);
       srv->clients[srv->client_count].fd = client_sock;
-      srv->clients[srv->client_count].is_handshaked = 0;
+      srv->clients[srv->client_count].state = WS_STATE_CONNECTING;
       srv->clients[srv->client_count].message_buffer = NULL;
       srv->clients[srv->client_count].message_length = 0;
       srv->clients[srv->client_count].srv = srv;
@@ -343,7 +403,7 @@ void handle_events(
         pthread_mutex_lock(&srv->clients_mutex);
         for (int j = 0; j < srv->client_count; j++) {
           if (srv->clients[j].fd == client_sock) {
-            srv->clients[j].is_handshaked = 1;
+            srv->clients[j].state = WS_STATE_OPEN;
             break;
           }
         }
@@ -368,6 +428,7 @@ void handle_events(
 
 // Example callback functions
 void on_open(client_t *client) {
+  if (!client) return;
   printf("Client %d connected\n", client->fd);
 }
 
@@ -379,32 +440,26 @@ void on_data(
   } else {
     printf("Received message from client %d: %d bytes\n", client->fd, (int)length);
   }
+  if (!client || client->state != WS_STATE_OPEN) return;
   // Echo the data back to the client
-  uint8_t frame[2 + length];
-  frame[0] = FIN_BIT | WS_FR_OP_TXT; // FIN + text frame
-  frame[1] = length;
-  memcpy(frame + 2, data, length);
-  if (write(client->fd, frame, sizeof(frame)) < 0) {
-    perror("write on data");
-  }
+  ws_send_frame((struct connection_t *)client, opcode, (const char *)data, length);
 }
 
 void on_close(client_t *client) {
+  if (!client) return;
   printf("Client %d disconnected\n", client->fd);
 }
 
 void on_ping(client_t *client) {
+  if (!client) return;
   printf("Received ping from client %d\n", client->fd);
+  if (client->state != WS_STATE_OPEN) return;
   // Send pong response
-  uint8_t frame[2];
-  frame[0] = FIN_BIT | WS_FR_OP_PONG; // FIN + pong frame
-  frame[1] = 0x00; // No payload
-  if (write(client->fd, frame, sizeof(frame)) < 0) {
-    perror("write on ping");
-  }
+  ws_send_frame((struct connection_t *)client, WS_FR_OP_PONG, NULL, 0);
 }
 
 void on_pong(client_t *client) {
+  if (!client) return;
   printf("Received pong from client %d\n", client->fd);
 }
 
@@ -413,15 +468,11 @@ void on_periodic(server_t *srv) {
 
   pthread_mutex_lock(&srv->clients_mutex);
   for (int i = 0; i < srv->client_count; i++) {
-    if (srv->clients[i].is_handshaked) {
+    if (srv->clients[i].state == WS_STATE_OPEN) {
       const char *message = "Periodic message";
-      uint8_t frame[2 + strlen(message)];
-      frame[0] = FIN_BIT | WS_FR_OP_TXT; // FIN + text frame
-      frame[1] = strlen(message);
-      memcpy(frame + 2, message, strlen(message));
-      if (write(srv->clients[i].fd, frame, sizeof(frame)) < 0) {
-        perror("write on periodic");
-      }
+      ws_send_frame(
+        (struct connection_t *)&srv->clients[i], WS_FR_OP_TXT, message, strlen(message)
+      );
     }
   }
   pthread_mutex_unlock(&srv->clients_mutex);
@@ -432,6 +483,8 @@ void *send_periodic_message(void *arg) {
   if (!srv || !(*srv->events.on_periodic)) return NULL;
   while (1) {
     sleep(PERIODIC_MESSAGE_INTERVAL);
+
+    if (srv->is_stop) break;
 
     (*srv->events.on_periodic)(srv);
   }
@@ -485,12 +538,14 @@ int main() {
     int num_events = epoll_wait(srv.epoll_fd, events, MAX_EVENTS, -1);
     if (num_events == -1) {
       perror("epoll_wait");
+      srv.is_stop = 1;
       break;
     }
 
     handle_events(&srv, events, num_events);
   }
   pthread_mutex_destroy(&srv.clients_mutex);
+  pthread_join(periodic_thread, NULL);
 
 done:
   close(srv.fd);

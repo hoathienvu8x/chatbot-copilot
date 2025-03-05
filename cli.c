@@ -45,6 +45,7 @@ struct client_t {
     const uint8_t *data, size_t length
   );
   void (*on_periodic)(client_t *client);
+  int is_stop;
 };
 
 void set_non_blocking(int sock) {
@@ -291,6 +292,9 @@ void *send_periodic_message(void *arg) {
     sleep(PERIODIC_MESSAGE_INTERVAL);
 
     pthread_mutex_lock(&client->client_mutex);
+
+    if (client->is_stop) break;
+
     if (client->is_handshaked) {
       (*client->on_periodic)(client);
     }
@@ -373,12 +377,14 @@ int main() {
     int num_events = epoll_wait(client.epoll_fd, events, 10, -1);
     if (num_events == -1) {
       perror("epoll_wait");
+      client.is_stop = 1;
       break;
     }
 
     handle_events(&client, events, num_events);
   }
   pthread_mutex_destroy(&client.client_mutex);
+  pthread_join(&periodic_thread, NULL);
 
 done:
   close(client.fd);
