@@ -18,20 +18,34 @@
 #define BUFFER_SIZE 2048
 #define PERIODIC_MESSAGE_INTERVAL 5 // seconds
 
-typedef void (*websocket_callback_t)(int client_sock);
-typedef void (*data_callback_t)(int client_sock, const uint8_t *data, size_t length);
+#define FIN_BIT 0x80
+#define WS_FR_OP_CONT 0
+#define WS_FR_OP_TXT  1
+#define WS_FR_OP_BIN  2
+#define WS_FR_OP_CLSE 8
+#define WS_FR_OP_PING 0x9
+#define WS_FR_OP_PONG 0xA
 
-pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
+typedef struct client_t client_t;
 
-typedef struct {
+struct client_t {
   int fd;
   int is_handshaked;
+  int epoll_fd;
+  pthread_mutex_t client_mutex;
   uint8_t *message_buffer;
   size_t message_length;
   uint8_t continuation_opcode;
-} client_t;
-
-client_t client;
+  void (*on_open)(client_t *client);
+  void (*on_close)(client_t *client);
+  void (*on_ping)(client_t *client);
+  void (*on_pong)(client_t *client);
+  void (*on_data)(
+    client_t *client, const uint8_t opcode,
+    const uint8_t *data, size_t length
+  );
+  void (*on_periodic)(client_t *client);
+};
 
 void set_non_blocking(int sock) {
   int flags = fcntl(sock, F_GETFL, 0);
@@ -72,9 +86,7 @@ void append_to_message_buffer(client_t *client, const uint8_t *data, size_t leng
 }
 
 void parse_websocket_frame(
-  client_t *client, const uint8_t *buffer, size_t length,
-  data_callback_t data_callback, websocket_callback_t on_ping,
-  websocket_callback_t on_pong
+  client_t *client, const uint8_t *buffer, size_t length
 ) {
   if (length < 2) {
     fprintf(stderr, "Frame too short\n");
@@ -132,29 +144,48 @@ void parse_websocket_frame(
   }
 
   switch (opcode) {
-    case 0x0: // Continuation frame
+    case WS_FR_OP_CONT: // Continuation frame
       append_to_message_buffer(client, payload_data, payload_len);
       if (fin) {
-        data_callback(client->fd, client->message_buffer, client->message_length);
+        if (*client->on_data) {
+          (*client->on_data)(
+            client, client->continuation_opcode,
+            client->message_buffer, client->message_length
+          );
+        }
         free(client->message_buffer);
         client->message_buffer = NULL;
         client->message_length = 0;
       }
       break;
-    case 0x1: // Text frame
-    case 0x2: // Binary frame
+    case WS_FR_OP_TXT: // Text frame
+    case WS_FR_OP_BIN: // Binary frame
       if (fin) {
-        data_callback(client->fd, payload_data, payload_len);
+        if (*client->on_data) {
+          (*client->on_data)(client, opcode, payload_data, payload_len);
+        }
       } else {
         client->continuation_opcode = opcode;
         append_to_message_buffer(client, payload_data, payload_len);
       }
       break;
     case 0x9: // Ping frame
-      on_ping(client->fd);
+      if (*client->on_ping) {
+        (*client->on_ping)(client);
+      } else {
+        // Send pong response
+        uint8_t frame[2];
+        frame[0] = 0x8A; // FIN + pong frame
+        frame[1] = 0x00; // No payload
+        if(send(client->fd, frame, sizeof(frame), 0) <= 0) {
+          perror("send");
+        }
+      }
       break;
     case 0xA: // Pong frame
-      on_pong(client->fd);
+      if (*client->on_pong) {
+        (*client->on_pong)(client);
+      }
       break;
     default:
       fprintf(stderr, "Unknown opcode: %u\n", opcode);
@@ -165,96 +196,105 @@ void parse_websocket_frame(
 }
 
 void handle_events(
-  int epoll_fd, struct epoll_event *events, int num_events,
-  websocket_callback_t on_open, data_callback_t on_data,
-  websocket_callback_t on_close, websocket_callback_t on_ping,
-  websocket_callback_t on_pong
+  client_t *client, struct epoll_event *events, int num_events
 ) {
-  (void)epoll_fd;
   for (int i = 0; i < num_events; i++) {
-    if (events[i].data.fd == client.fd) {
+    if (events[i].data.fd == client->fd) {
       uint8_t buffer[BUFFER_SIZE];
-      ssize_t bytes_read = read(client.fd, buffer, sizeof(buffer));
+      ssize_t bytes_read = read(client->fd, buffer, sizeof(buffer));
 
       if (bytes_read == -1) {
         if (errno != EAGAIN) {
           perror("read");
-          close(client.fd);
-          on_close(client.fd);
+          if (*client->on_close) {
+            (*client->on_close)(client);
+          }
+          close(client->fd);
         }
         continue;
       } else if (bytes_read == 0) {
         // Connection closed by server
-        close(client.fd);
-        on_close(client.fd);
+        close(client->fd);
+        if (*client->on_close) {
+          (*client->on_close)(client);
+        }
         continue;
       }
 
-      if (!client.is_handshaked) {
+      if (!client->is_handshaked) {
         // Assume handshake is successful for simplicity
-        client.is_handshaked = 1;
-        on_open(client.fd);
+        client->is_handshaked = 1;
+        if (*client->on_open) {
+          (*client->on_open)(client);
+        }
       } else {
         // Handle WebSocket frame
-        parse_websocket_frame(&client, buffer, bytes_read, on_data, on_ping, on_pong);
+        parse_websocket_frame(client, buffer, bytes_read);
       }
     }
   }
 }
 
 // Example callback functions
-void on_open(int client_sock) {
-  (void)client_sock;
+void on_open(client_t *client) {
+  if (!client) return;
   printf("Connected to server\n");
 }
 
-void on_data(int client_sock, const uint8_t *data, size_t length) {
-  (void)client_sock;
-  printf("Received message: %.*s\n", (int)length, data);
+void on_data(client_t *client, const uint8_t opcode, const uint8_t *data, size_t length) {
+  if (!client) return;
+  if (opcode == WS_FR_OP_TXT) {
+    printf("Received message: %.*s\n", (int)length, data);
+  } else {
+    printf("Received message: %d bytess\n", (int)length);
+  }
 }
 
-void on_close(int client_sock) {
-  (void)client_sock;
+void on_close(client_t *client) {
+  if (!client) return;
   printf("Disconnected from server\n");
 }
 
-void on_ping(int client_sock) {
+void on_ping(client_t *client) {
   printf("Received ping\n");
+  if (!client) return;
   // Send pong response
   uint8_t frame[2];
   frame[0] = 0x8A; // FIN + pong frame
   frame[1] = 0x00; // No payload
-  if(send(client_sock, frame, sizeof(frame), 0) <= 0) {
+  if(send(client->fd, frame, sizeof(frame), 0) <= 0) {
     perror("send");
   }
 }
 
-void on_pong(int client_sock) {
-  (void)client_sock;
+void on_pong(client_t *client) {
+  (void)client;
   printf("Received pong\n");
 }
 
-void on_periodic(int client_sock) {
+void on_periodic(client_t *client) {
+  if (!client) return;
   const char *message = "Periodic message from client";
   uint8_t frame[2 + strlen(message)];
   frame[0] = 0x81; // FIN + text frame
   frame[1] = strlen(message);
   memcpy(frame + 2, message, strlen(message));
-  if (send(client_sock, frame, sizeof(frame), 0) <= 0) {
+  if (send(client->fd, frame, sizeof(frame), 0) <= 0) {
     perror("send");
   }
 }
 
 void *send_periodic_message(void *arg) {
-  (void)arg;
+  client_t *client = (client_t *)arg;
+  if (!client || !(*client->on_periodic)) return NULL;
   while (1) {
     sleep(PERIODIC_MESSAGE_INTERVAL);
 
-    pthread_mutex_lock(&client_mutex);
-    if (client.is_handshaked) {
-      on_periodic(client.fd);
+    pthread_mutex_lock(&client->client_mutex);
+    if (client->is_handshaked) {
+      (*client->on_periodic)(client);
     }
-    pthread_mutex_unlock(&client_mutex);
+    pthread_mutex_unlock(&client->client_mutex);
   }
 
   return NULL;
@@ -264,12 +304,15 @@ int main() {
   const char *host = "localhost";
   const char *path = "/";
   int port = 8080;
+  client_t client;
 
   struct hostent *server = gethostbyname(host);
   if (server == NULL) {
     fprintf(stderr, "ERROR, no such host\n");
     exit(1);
   }
+
+  memset(&client, 0, sizeof(client_t));
 
   client.fd = socket(AF_INET, SOCK_STREAM, 0);
   if (client.fd == -1) {
@@ -295,10 +338,15 @@ int main() {
   client.message_buffer = NULL;
   client.message_length = 0;
 
+  client.on_open = on_open;
+  client.on_close = on_close;
+  client.on_data = on_data;
+  client.on_periodic = on_periodic;
+
   perform_websocket_handshake(client.fd, host, path);
 
-  int epoll_fd = epoll_create1(0);
-  if (epoll_fd == -1) {
+  client.epoll_fd = epoll_create1(0);
+  if (client.epoll_fd == -1) {
     perror("epoll_create1");
     close(client.fd);
     exit(EXIT_FAILURE);
@@ -307,34 +355,33 @@ int main() {
   struct epoll_event event;
   event.events = EPOLLIN | EPOLLET;
   event.data.fd = client.fd;
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client.fd, &event) == -1) {
+  if (epoll_ctl(client.epoll_fd, EPOLL_CTL_ADD, client.fd, &event) == -1) {
     perror("epoll_ctl: client_sock");
-    close(client.fd);
-    close(epoll_fd);
-    exit(EXIT_FAILURE);
+    goto done;
   }
 
   struct epoll_event events[10];
 
-  pthread_t periodic_thread;
-  pthread_create(&periodic_thread, NULL, send_periodic_message, NULL);
-
-  while (1) {
-    int num_events = epoll_wait(epoll_fd, events, 10, -1);
-    if (num_events == -1) {
-      perror("epoll_wait");
-      close(client.fd);
-      close(epoll_fd);
-      exit(EXIT_FAILURE);
-    }
-
-    handle_events(
-      epoll_fd, events, num_events, on_open, on_data,
-      on_close, on_ping, on_pong
-    );
+  if (pthread_mutex_init(&client.client_mutex, NULL) != 0) {
+    goto done;
   }
 
+  pthread_t periodic_thread;
+  pthread_create(&periodic_thread, NULL, send_periodic_message, &client);
+
+  while (1) {
+    int num_events = epoll_wait(client.epoll_fd, events, 10, -1);
+    if (num_events == -1) {
+      perror("epoll_wait");
+      break;
+    }
+
+    handle_events(&client, events, num_events);
+  }
+  pthread_mutex_destroy(&client.client_mutex);
+
+done:
   close(client.fd);
-  close(epoll_fd);
+  close(client.epoll_fd);
   return 0;
 }
