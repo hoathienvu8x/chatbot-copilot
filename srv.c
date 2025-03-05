@@ -36,7 +36,7 @@ typedef struct client_t client_t;
 typedef struct server_t server_t;
 
 struct ringbuf_t {
-  char *data;
+  char data[BUFFER_SIZE];
   size_t pos;
   size_t len;
 };
@@ -50,6 +50,7 @@ struct connection_t {
 struct client_t {
   int fd;
   int state;
+  struct ringbuf_t buf;
   server_t *srv;
   uint8_t *message_buffer;
   size_t message_length;
@@ -132,7 +133,7 @@ int ws_restrict_read(struct connection_t *conn, void *buf, size_t length) {
   char *p = buf;
   for (; i < length; i++) {
     if (conn->buf.pos == 0 || conn->buf.pos == conn->buf.len) {
-      int ret = read(conn->fd, conn->buf.data, sizeof(conn->buf.data));
+      int ret = recv(conn->fd, conn->buf.data, sizeof(conn->buf.data), 0);
       if (ret <= 0) return ret;
       conn->buf.pos = 0;
       conn->buf.len = (size_t)ret;
@@ -220,136 +221,247 @@ void append_to_message_buffer(client_t *client, const uint8_t *data, size_t leng
   client->message_length += length;
 }
 
-void parse_websocket_frame(
-  client_t *client, const uint8_t *buffer, size_t length
-) {
-  if (length < 2) {
-    fprintf(stderr, "Frame too short\n");
-    return;
-  }
-
-  if (client == NULL) {
-    fprintf(stderr, "Client not found\n");
-    return;
-  }
-
-  uint8_t fin = (buffer[0] & 0x80) >> 7;
-  uint8_t opcode = buffer[0] & 0x0F;
-  uint8_t masked = (buffer[1] & 0x80) >> 7;
-  uint64_t payload_len = buffer[1] & 0x7F;
-
-  size_t offset = 2;
-
-  if (payload_len == 126) {
-    if (length < 4) {
-      fprintf(stderr, "Frame too short for 126 length\n");
-      return;
-    }
-    payload_len = (buffer[2] << 8) | buffer[3];
-    offset += 2;
-  } else if (payload_len == 127) {
-    if (length < 10) {
-      fprintf(stderr, "Frame too short for 127 length\n");
-      return;
-    }
-    payload_len = 0;
-    for (int i = 0; i < 8; ++i) {
-      payload_len = (payload_len << 8) | buffer[2 + i];
-    }
-    offset += 8;
-  }
-
-  uint8_t masking_key[4];
-  if (masked) {
-    if (length < offset + 4) {
-      fprintf(stderr, "Frame too short for masking key\n");
-      return;
-    }
-    memcpy(masking_key, buffer + offset, 4);
-    offset += 4;
-  }
-
-  if (length < offset + payload_len) {
-    fprintf(stderr, "Frame too short for payload data\n");
-    return;
-  }
-
-  uint8_t *payload_data = malloc(payload_len);
-  memcpy(payload_data, buffer + offset, payload_len);
-
-  if (masked) {
-    for (uint64_t i = 0; i < payload_len; ++i) {
-      payload_data[i] ^= masking_key[i % 4];
-    }
-  }
-
+void websocket_handle_client(client_t *client) {
+  if (!client) return;
+  uint8_t buffer[BUFFER_SIZE] = {0};
+  int n;
   server_t *srv = client->srv;
+  if (client->state == WS_STATE_CONNECTING) {
+    uint8_t *data = NULL;
+    uint8_t buf[BUFFER_SIZE] = {0};
+    size_t recv_len = 0;
+    int bytes_read = 0;
+    do {
+      n = ws_restrict_read(
+        (struct connection_t *)client, buf + bytes_read, 1
+      );
+      if (n <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        perror("recv()");
+        break;
+      }
+      bytes_read += n;
+      if (
+        strstr((char *)buf, "\r\n\r\n") != NULL ||
+        bytes_read == (int)sizeof(buf)
+      ) {
+        uint8_t *tmp = realloc(data, recv_len + bytes_read + 1);
+        if (!tmp) {
+          n = -1;
+          break;
+        }
+        data = tmp;
+        memcpy(data + recv_len, buf, bytes_read);
+        recv_len += bytes_read;
+      }
+      if (bytes_read == (int)sizeof(buf)) {
+        memset(buf, 0, sizeof(buf));
+        bytes_read = 0;
+      }
+      if (strstr((char *)buf, "\r\n\r\n") != NULL) break;
+    } while (n > 0);
 
-  switch (opcode) {
-    case WS_FR_OP_CONT: // Continuation frame
-      append_to_message_buffer(client, payload_data, payload_len);
-      if (fin) {
-        if (srv && *srv->events.on_data) {
-          (*srv->events.on_data)(
-            client, client->continuation_opcode,
-            client->message_buffer, client->message_length
-          );
-        }
-        free(client->message_buffer);
-        client->message_buffer = NULL;
-        client->message_length = 0;
+    if (n <= 0 || !data) {
+      if (data) free(data);
+      goto ABORT;
+    }
+
+    if (strstr((char *)data, "\r\n\r\n") == NULL) {
+      free(data);
+      goto ABORT;
+    }
+
+    *(data + recv_len) = '\0';
+
+    char *client_key = strstr((char*)data, "Sec-WebSocket-Key: ");
+    if (!client_key) {
+      free(data);
+      goto ABORT;
+    }
+    client_key += 19;
+    char *end_key = strstr(client_key, "\r\n");
+    *end_key = '\0';
+
+    handle_websocket_handshake(client->fd, client_key);
+    free(data);
+
+    client->state = WS_STATE_OPEN;
+    if (srv && *srv->events.on_open) {
+      (*srv->events.on_open)(client);
+    }
+  }
+
+  for (;;) {
+    n = ws_restrict_read(
+      (struct connection_t *)client, buffer, 2
+    );
+    if (n <= 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
       }
-      break;
-    case WS_FR_OP_TXT: // Text frame
-    case WS_FR_OP_BIN: // Binary frame
-      if (fin) {
-        if (srv && *srv->events.on_data) {
-          (*srv->events.on_data)(
-            client, opcode, payload_data, payload_len
-          );
+      goto ABORT;
+    }
+    if (n < 2) {
+      client->buf.pos -= n;
+      continue;
+    }
+    uint8_t fin = (buffer[0] & 0x80) >> 7;
+    uint8_t opcode = buffer[0] & 0x0F;
+    uint8_t masked = (buffer[1] & 0x80) >> 7;
+    uint64_t payload_len = buffer[1] & 0x7F;
+    uint8_t masking_key[4];
+    if (payload_len == 126) {
+      n = ws_restrict_read(
+        (struct connection_t *)client, buffer, 2
+      );
+      if (n <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
         }
-      } else {
-        client->continuation_opcode = opcode;
+        goto ABORT;
+      }
+      if (n < 2) {
+        client->buf.pos -= n;
+        continue;
+      }
+      payload_len = (buffer[0] << 8) | buffer[1];
+    } else if (payload_len == 127) {
+      n = ws_restrict_read(
+        (struct connection_t *)client, buffer, 8
+      );
+      if (n <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        goto ABORT;
+      }
+      if (n < 8) {
+        client->buf.pos -= n;
+        continue;
+      }
+      payload_len = 0;
+      for (int i = 0; i < 8; i++) {
+        payload_len = (payload_len << 8) | buffer[i];
+      }
+    }
+
+    if (masked) {
+      n = ws_restrict_read(
+        (struct connection_t *)client, buffer, 4
+      );
+      if (n <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        goto ABORT;
+      }
+      if (n < 4) {
+        client->buf.pos -= n;
+        continue;
+      }
+      memcpy(masking_key, buffer, 4);
+    }
+
+    uint8_t *payload_data = malloc(payload_len);
+    memset(payload_data, 0, payload_len);
+    int bytes_read = 0;
+    do {
+      n = ws_restrict_read(
+        (struct connection_t *)client, payload_data + bytes_read,
+        payload_len - bytes_read
+      );
+      if (n <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        free(payload_data);
+        goto ABORT;
+      }
+      bytes_read += n;
+    } while (n > 0 && bytes_read < (int)payload_len);
+
+    if (masked) {
+      for (uint64_t i = 0; i < payload_len; ++i) {
+        payload_data[i] ^= masking_key[i % 4];
+      }
+    }
+
+    switch (opcode) {
+      case WS_FR_OP_CONT: // Continuation frame
         append_to_message_buffer(client, payload_data, payload_len);
-      }
-      break;
-    case WS_FR_OP_CLSE: // Close frame
-      printf("Received close frame from client %d\n", client->fd);
-      // Connection closed by client
-      if (srv) {
-        pthread_mutex_lock(&srv->clients_mutex);
-        for (int j = 0; j < srv->client_count; j++) {
-          if (srv->clients[j].fd == client->fd) {
-            free(srv->clients[j].message_buffer);
-            srv->clients[j] = srv->clients[--srv->client_count];
-            break;
+        if (fin) {
+          if (srv && *srv->events.on_data) {
+            (*srv->events.on_data)(
+              client, client->continuation_opcode,
+              client->message_buffer, client->message_length
+            );
+          }
+          free(client->message_buffer);
+          client->message_buffer = NULL;
+          client->message_length = 0;
+        }
+        break;
+      case WS_FR_OP_TXT: // Text frame
+      case WS_FR_OP_BIN: // Binary frame
+        if (fin) {
+          if (srv && *srv->events.on_data) {
+            (*srv->events.on_data)(
+              client, opcode, payload_data, payload_len
+            );
+          }
+        } else {
+          client->continuation_opcode = opcode;
+          append_to_message_buffer(client, payload_data, payload_len);
+        }
+        break;
+      case WS_FR_OP_CLSE: // Close frame
+        printf("Received close frame from client %d\n", client->fd);
+        // Connection closed by client
+        if (srv) {
+          pthread_mutex_lock(&srv->clients_mutex);
+          for (int j = 0; j < srv->client_count; j++) {
+            if (srv->clients[j].fd == client->fd) {
+              free(srv->clients[j].message_buffer);
+              srv->clients[j] = srv->clients[--srv->client_count];
+              break;
+            }
+          }
+          pthread_mutex_unlock(&srv->clients_mutex);
+          if (*srv->events.on_close) {
+            (*srv->events.on_close)(client);
           }
         }
-        pthread_mutex_unlock(&srv->clients_mutex);
-        if (*srv->events.on_close) {
-          (*srv->events.on_close)(client);
+        close(client->fd);
+        break;
+      case WS_FR_OP_PING: // Ping frame
+        if (srv && *srv->events.on_ping) {
+          (*srv->events.on_ping)(client);
+        } else {
+          ws_send_frame((struct connection_t *)client, WS_FR_OP_PONG, NULL, 0);
         }
-      }
-      close(client->fd);
+        break;
+      case WS_FR_OP_PONG: // Pong frame
+        if (srv && *srv->events.on_pong) {
+          (*srv->events.on_pong)(client);
+        }
+        break;
+      default:
+        fprintf(stderr, "Unknown opcode: %u\n", opcode);
+        break;
+    }
+    free(payload_data);
+    if (opcode != WS_FR_OP_CONT) {
       break;
-    case WS_FR_OP_PING: // Ping frame
-      if (srv && *srv->events.on_ping) {
-        (*srv->events.on_ping)(client);
-      } else {
-        ws_send_frame((struct connection_t *)client, WS_FR_OP_PONG, NULL, 0);
-      }
-      break;
-    case WS_FR_OP_PONG: // Pong frame
-      if (srv && *srv->events.on_pong) {
-        (*srv->events.on_pong)(client);
-      }
-      break;
-    default:
-      fprintf(stderr, "Unknown opcode: %u\n", opcode);
-      break;
+    }
   }
 
-  free(payload_data);
+  return;
+
+ABORT:
+  close(client->fd);
+  client->state = WS_STATE_CLOSED;
 }
 
 void handle_events(
@@ -383,6 +495,7 @@ void handle_events(
       srv->clients[srv->client_count].message_buffer = NULL;
       srv->clients[srv->client_count].message_length = 0;
       srv->clients[srv->client_count].srv = srv;
+      memset(&srv->clients[srv->client_count].buf, 0, sizeof(struct ringbuf_t));
       srv->client_count++;
       pthread_mutex_unlock(&srv->clients_mutex);
     } else {
@@ -398,7 +511,7 @@ void handle_events(
       pthread_mutex_unlock(&srv->clients_mutex);
       // Handle WebSocket frame
       if (!cli) continue;
-      parse_websocket_frame(cli);
+      websocket_handle_client(cli);
     }
   }
 }
