@@ -17,6 +17,14 @@
 #define BUFFER_SIZE 2048
 #define PERIODIC_MESSAGE_INTERVAL 5 // seconds
 
+#define FIN_BIT 0x80
+#define WS_FR_OP_CONT 0
+#define WS_FR_OP_TXT  1
+#define WS_FR_OP_BIN  2
+#define WS_FR_OP_CLSE 8
+#define WS_FR_OP_PING 0x9
+#define WS_FR_OP_PONG 0xA
+
 typedef struct {
   int fd;
   int is_handshaked;
@@ -107,7 +115,7 @@ void append_to_message_buffer(client_t *client, const uint8_t *data, size_t leng
 void parse_websocket_frame(
   int client_sock, const uint8_t *buffer, size_t length,
   data_callback_t data_callback, websocket_callback_t on_ping,
-  websocket_callback_t on_pong
+  websocket_callback_t on_pong, websocket_callback_t on_close
 ) {
   if (length < 2) {
     fprintf(stderr, "Frame too short\n");
@@ -180,7 +188,7 @@ void parse_websocket_frame(
   }
 
   switch (opcode) {
-    case 0x0: // Continuation frame
+    case WS_FR_OP_CONT: // Continuation frame
       append_to_message_buffer(client, payload_data, payload_len);
       if (fin) {
         data_callback(client_sock, client->message_buffer, client->message_length);
@@ -189,8 +197,8 @@ void parse_websocket_frame(
         client->message_length = 0;
       }
       break;
-    case 0x1: // Text frame
-    case 0x2: // Binary frame
+    case WS_FR_OP_TXT: // Text frame
+    case WS_FR_OP_BIN: // Binary frame
       if (fin) {
         data_callback(client_sock, payload_data, payload_len);
       } else {
@@ -198,10 +206,26 @@ void parse_websocket_frame(
         append_to_message_buffer(client, payload_data, payload_len);
       }
       break;
-    case 0x9: // Ping frame
+    case WS_FR_OP_CLSE: // Close frame
+      printf("Received close frame from client %d\n", client->fd);
+      // Connection closed by client
+      pthread_mutex_lock(&clients_mutex);
+      for (int j = 0; j < client_count; j++) {
+        if (clients[j].fd == client_sock) {
+          free(clients[j].message_buffer);
+          clients[j] = clients[--client_count];
+          break;
+        }
+      }
+      pthread_mutex_unlock(&clients_mutex);
+      close(client_sock);
+      on_close(client_sock);
+      close(client->fd);
+      break;
+    case WS_FR_OP_PING: // Ping frame
       on_ping(client_sock);
       break;
-    case 0xA: // Pong frame
+    case WS_FR_OP_PONG: // Pong frame
       on_pong(client_sock);
       break;
     default:
@@ -294,7 +318,9 @@ void handle_events(
         pthread_mutex_unlock(&clients_mutex);
       } else {
         // Handle WebSocket frame
-        parse_websocket_frame(client_sock, buffer, bytes_read, on_data, on_ping, on_pong);
+        parse_websocket_frame(
+          client_sock, buffer, bytes_read, on_data, on_ping, on_pong, on_close
+        );
       }
     }
   }
@@ -309,11 +335,11 @@ void on_data(int client_sock, const uint8_t *data, size_t length) {
   printf("Received message from client %d: %.*s\n", client_sock, (int)length, data);
   // Echo the data back to the client
   uint8_t frame[2 + length];
-  frame[0] = 0x81; // FIN + text frame
+  frame[0] = FIN_BIT | WS_FR_OP_TXT; // FIN + text frame
   frame[1] = length;
   memcpy(frame + 2, data, length);
   if (write(client_sock, frame, sizeof(frame)) < 0) {
-    perror("write");
+    perror("write on data");
   }
 }
 
@@ -325,10 +351,10 @@ void on_ping(int client_sock) {
   printf("Received ping from client %d\n", client_sock);
   // Send pong response
   uint8_t frame[2];
-  frame[0] = 0x8A; // FIN + pong frame
+  frame[0] = FIN_BIT | WS_FR_OP_PONG; // FIN + pong frame
   frame[1] = 0x00; // No payload
   if (write(client_sock, frame, sizeof(frame)) < 0) {
-    perror("write");
+    perror("write on ping");
   }
 }
 
@@ -339,11 +365,11 @@ void on_pong(int client_sock) {
 void on_periodic(int client_sock) {
   const char *message = "Periodic message";
   uint8_t frame[2 + strlen(message)];
-  frame[0] = 0x81; // FIN + text frame
+  frame[0] = FIN_BIT | WS_FR_OP_TXT; // FIN + text frame
   frame[1] = strlen(message);
   memcpy(frame + 2, message, strlen(message));
   if (write(client_sock, frame, sizeof(frame)) < 0) {
-    perror("write");
+    perror("write on periodic");
   }
 }
 
