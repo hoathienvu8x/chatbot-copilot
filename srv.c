@@ -41,16 +41,17 @@ struct ringbuf_t {
   size_t len;
 };
 
-struct connection_t {
-  int fd;
-  int state;
+#define connection_properties \
+  int fd; \
+  int state; \
   struct ringbuf_t buf;
+
+struct connection_t {
+  connection_properties
 };
 
 struct client_t {
-  int fd;
-  int state;
-  struct ringbuf_t buf;
+  connection_properties
   server_t *srv;
   uint8_t *message_buffer;
   size_t message_length;
