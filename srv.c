@@ -14,7 +14,7 @@
 
 #define MAX_EVENTS 10
 #define PORT 8080
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE 512
 #define BUFFER_CHUNK (BUFFER_SIZE - 10)
 #define PERIODIC_MESSAGE_INTERVAL 5 // seconds
 
@@ -35,9 +35,16 @@
 typedef struct client_t client_t;
 typedef struct server_t server_t;
 
+struct ringbuf_t {
+  char *data;
+  size_t pos;
+  size_t len;
+};
+
 struct connection_t {
   int fd;
   int state;
+  struct ringbuf_t buf;
 };
 
 struct client_t {
@@ -69,6 +76,7 @@ struct server_t {
   client_t clients[FD_SETSIZE];
   struct event_callback_t events;
   int is_stop;
+  void *data;
 };
 
 void set_non_blocking(int sock) {
@@ -117,6 +125,21 @@ int create_listen_socket() {
 int ws_send_data(int fd, const char *data, size_t length) {
   if (!data || length == 0) return -1;
   return write(fd, data, length);
+}
+
+int ws_restrict_read(struct connection_t *conn, void *buf, size_t length) {
+  size_t i = 0;
+  char *p = buf;
+  for (; i < length; i++) {
+    if (conn->buf.pos == 0 || conn->buf.pos == conn->buf.len) {
+      int ret = read(conn->fd, conn->buf.data, sizeof(conn->buf.data));
+      if (ret <= 0) return ret;
+      conn->buf.pos = 0;
+      conn->buf.len = (size_t)ret;
+    }
+    p[i] = conn->buf.data[conn->buf.pos++];
+  }
+  return (int)i;
 }
 
 void ws_send_frame(
@@ -177,11 +200,14 @@ void handle_websocket_handshake(int client_sock, const char *client_key) {
   SHA1((unsigned char *)combined_key, strlen(combined_key), sha1_hash);
   base64_encode(sha1_hash, SHA1_BLOCK_SIZE, encoded_hash);
 
-  snprintf(response, sizeof(response),
-           "HTTP/1.1 101 Switching Protocols\r\n"
-           "Upgrade: websocket\r\n"
-           "Connection: Upgrade\r\n"
-           "Sec-WebSocket-Accept: %s\r\n\r\n", encoded_hash);
+  snprintf(
+    response, sizeof(response),
+    "HTTP/1.1 101 Switching Protocols\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Accept: %s\r\n\r\n",
+    encoded_hash
+  );
 
   if (ws_send_data(client_sock, response, strlen(response)) < 0) {
     perror("write");
@@ -357,71 +383,22 @@ void handle_events(
       srv->clients[srv->client_count].message_buffer = NULL;
       srv->clients[srv->client_count].message_length = 0;
       srv->clients[srv->client_count].srv = srv;
-      client_t *cli = &srv->clients[srv->client_count];
       srv->client_count++;
       pthread_mutex_unlock(&srv->clients_mutex);
-      if (*srv->events.on_open) {
-        (*srv->events.on_open)(cli);
-      }
     } else {
       // Handle client data
-      int client_sock = events[i].data.fd;
-      uint8_t buffer[BUFFER_SIZE];
-      int bytes_read = read(client_sock, buffer, sizeof(buffer) - 1);
-      if (bytes_read == -1) {
-        if (errno != EAGAIN) {
-          perror("read");
-          close(client_sock);
+      client_t *cli = NULL;
+      pthread_mutex_lock(&srv->clients_mutex);
+      for (int j = 0; j < srv->client_count; j++) {
+        if (srv->clients[j].fd == events[i].data.fd) {
+          cli = &srv->clients[j];
+          break;
         }
-        continue;
-      } else if (bytes_read == 0) {
-        // Connection closed by client
-        pthread_mutex_lock(&srv->clients_mutex);
-        for (int j = 0; j < srv->client_count; j++) {
-          if (srv->clients[j].fd == client_sock) {
-            free(srv->clients[j].message_buffer);
-            srv->clients[j] = srv->clients[--srv->client_count];
-            break;
-          }
-        }
-        pthread_mutex_unlock(&srv->clients_mutex);
-        close(client_sock);
-        /* if(srv->events.on_close) {
-          (srv->events.on_close)(client);
-        } */
-        continue;
       }
-
-      buffer[bytes_read] = '\0';
-      if (strstr((char*)buffer, "Sec-WebSocket-Key: ")) {
-        // Handle WebSocket handshake
-        char *client_key = strstr((char*)buffer, "Sec-WebSocket-Key: ") + 19;
-        char *end_key = strstr(client_key, "\r\n");
-        *end_key = '\0';
-        handle_websocket_handshake(client_sock, client_key);
-
-        pthread_mutex_lock(&srv->clients_mutex);
-        for (int j = 0; j < srv->client_count; j++) {
-          if (srv->clients[j].fd == client_sock) {
-            srv->clients[j].state = WS_STATE_OPEN;
-            break;
-          }
-        }
-        pthread_mutex_unlock(&srv->clients_mutex);
-      } else {
-        client_t *cli = NULL;
-        pthread_mutex_lock(&srv->clients_mutex);
-        for (int j = 0; j < srv->client_count; j++) {
-          if (srv->clients[j].fd == client_sock) {
-            cli = &srv->clients[j];
-            break;
-          }
-        }
-        pthread_mutex_unlock(&srv->clients_mutex);
-        // Handle WebSocket frame
-        if (!cli) continue;
-        parse_websocket_frame(cli, buffer, bytes_read);
-      }
+      pthread_mutex_unlock(&srv->clients_mutex);
+      // Handle WebSocket frame
+      if (!cli) continue;
+      parse_websocket_frame(cli);
     }
   }
 }

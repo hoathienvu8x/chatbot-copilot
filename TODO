@@ -1,0 +1,82 @@
+void websocket_handle_client(client_t *client) {
+  if (!client) return;
+
+  server_t *srv = client->srv;
+  if (client->state == WS_STATE_CONNECTING) {
+    uint8_t *data = NULL;
+    uint8_t buf[BUFFER_SIZE] = {0};
+    uint8_t buffer[BUFFER_SIZE] = {0};
+    size_t recv_len = 0;
+    int bytes_read = 0, n;
+    do {
+      n = ws_restrict_read(
+        (struct connection_t *)client, buf + bytes_read, 1
+      );
+      if (n <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          continue;
+        }
+        break;
+      }
+      bytes_read += n;
+      if (
+        strstr((char *)buf, "\r\n\r\n") != NULL ||
+        bytes_read == (int)sizeof(buf)
+      ) {
+        uint8_t *tmp = realoc(data, recv_len + bytes_read + 1);
+        if (!tmp) {
+          n = -1;
+          break;
+        }
+        data = tmp;
+        memcpy(data + recv_len, buf, bytes_read);
+        recv_len += bytes_read;
+      }
+      if (bytes_read == (int)sizeof(buf)) {
+        memset(buf, 0, sizeof(buf));
+        bytes_read = 0;
+      }
+      if (strstr((char *)buf, "\r\n\r\n") != NULL) break;
+    } while (n > 0);
+
+    if (n <= 0 || !data) {
+      if (data) free(data);
+      goto ABORT;
+    }
+
+    if (strstr((char *)data, "\r\n\r\n") == NULL) {
+      free(data);
+      goto ABORT;
+    }
+
+    *(data + recv_len) = '\0';
+
+    char *client_key = strstr((char*)data, "Sec-WebSocket-Key: ");
+    if (!client_key) {
+      free(data);
+      goto ABORT;
+    }
+    client_key += 19;
+    char *end_key = strstr(client_key, "\r\n");
+    *end_key = '\0';
+
+    handle_websocket_handshake(client->fd, client_key);
+    free(data);
+
+    client->state = WS_STATE_OPEN;
+    if (srv && *srv->events.on_open) {
+      (*srv->events.on_open)(client);
+    }
+  }
+
+  for (;;) {
+    recv_len = ws_restrict_read(
+      (struct connection_t *)client, buffer, 2
+    );
+  }
+
+  return;
+
+ABORT:
+  close(client->fd);
+}
