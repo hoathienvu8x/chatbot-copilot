@@ -1,3 +1,4 @@
+// https://tvc4.investing.com/44e7c79903937d90186ad4291a1f30c2/1741428038/1/1/8/quotes?symbols=ICE%3ALRC%2CXAU%2FUSD%2CEUR%2FUSD%2CGLOBAL%3ABRLPTAX%3DCBBR%2CBTC%2FUSD%2CLCOc1%2CNYSE%3ADXY
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,7 @@ struct connection_t {
 struct client_t {
   connection_properties
   server_t *srv;
+  size_t id;
   uint8_t *message_buffer;
   size_t message_length;
   uint8_t continuation_opcode;
@@ -73,6 +75,7 @@ struct event_callback_t {
 struct server_t {
   int fd;
   int epoll_fd;
+  size_t id;
   pthread_mutex_t clients_mutex;
   int client_count;
   client_t clients[FD_SETSIZE];
@@ -420,21 +423,8 @@ void websocket_handle_client(client_t *client) {
       case WS_FR_OP_CLSE: // Close frame
         printf("Received close frame from client %d\n", client->fd);
         // Connection closed by client
-        if (srv) {
-          pthread_mutex_lock(&srv->clients_mutex);
-          for (int j = 0; j < srv->client_count; j++) {
-            if (srv->clients[j].fd == client->fd) {
-              free(srv->clients[j].message_buffer);
-              srv->clients[j] = srv->clients[--srv->client_count];
-              break;
-            }
-          }
-          pthread_mutex_unlock(&srv->clients_mutex);
-          if (*srv->events.on_close) {
-            (*srv->events.on_close)(client);
-          }
-        }
-        close(client->fd);
+        free(payload_data);
+        goto ABORT;
         break;
       case WS_FR_OP_PING: // Ping frame
         if (srv && *srv->events.on_ping) {
@@ -461,6 +451,20 @@ void websocket_handle_client(client_t *client) {
   return;
 
 ABORT:
+  if (srv) {
+    pthread_mutex_lock(&srv->clients_mutex);
+    for (int j = 0; j < srv->client_count; j++) {
+      if (srv->clients[j].fd == client->fd) {
+        free(srv->clients[j].message_buffer);
+        srv->clients[j] = srv->clients[--srv->client_count];
+        break;
+      }
+    }
+    pthread_mutex_unlock(&srv->clients_mutex);
+    if (*srv->events.on_close) {
+      (*srv->events.on_close)(client);
+    }
+  }
   close(client->fd);
   client->state = WS_STATE_CLOSED;
 }

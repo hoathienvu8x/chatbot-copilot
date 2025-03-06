@@ -26,6 +26,11 @@
 #define WS_FR_OP_PING 0x9
 #define WS_FR_OP_PONG 0xA
 
+#define WS_STATE_CONNECTING 0
+#define WS_STATE_OPEN       1
+#define WS_STATE_CLOSING    2
+#define WS_STATE_CLOSED     3
+
 typedef struct client_t client_t;
 
 struct client_t {
@@ -383,8 +388,14 @@ int main() {
 
     handle_events(&client, events, num_events);
   }
+  uint8_t frame[2];
+  frame[0] = WS_FR_OP_CLSE | FIN_BIT; // FIN + pong frame
+  frame[1] = 0x00; // No payload
+  if(send(client.fd, frame, sizeof(frame), 0) <= 0) {
+    perror("send");
+  }
   pthread_mutex_destroy(&client.client_mutex);
-  pthread_join(&periodic_thread, NULL);
+  pthread_join(periodic_thread, NULL);
 
 done:
   close(client.fd);
