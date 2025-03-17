@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -268,7 +269,7 @@ int chatbot_server() {
 }
 
 int chatbot_client() {
-  int client_socket;
+  int client_socket, flag = 1;
   fd_set read_fds;
   char buffer[BUFFER_SIZE];
 
@@ -291,6 +292,8 @@ int chatbot_client() {
     close(client_socket);
     return -1;
   }
+
+  setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, (char*) &flag, sizeof(flag));
 
   #ifndef NDEBUG
   printf("Connected to the server at 127.0.0.1:%d\n", CHATBOT_PORT);
