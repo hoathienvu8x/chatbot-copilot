@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -16,6 +17,29 @@
 #define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
 
+static int set_non_blocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int send_message(int fd, const char* message) {
+  int retval = send(fd, message, strlen(message), 0);
+  if (retval < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+  }
+  return retval;
+}
+
+static int read_message(int fd, void *buf, size_t len) {
+  int retval = read(fd, buf, len);
+  if (retval < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return -EAGAIN;
+    return -1;
+  }
+  return retval;
+}
+
 static int sendJSONResponse(int client_socket, const char *message) {
     cJSON *response = cJSON_CreateObject();
     cJSON_AddStringToObject(response, "response", message);
@@ -24,7 +48,7 @@ static int sendJSONResponse(int client_socket, const char *message) {
     #else
     const char *json_response = cJSON_PrintUnformatted(response);
     #endif
-    int ret = write(client_socket, json_response, strlen(json_response));
+    int ret = send_message(client_socket, json_response);
     cJSON_Delete(response);
     free((void *)json_response);
     if (ret <= 0) return -1;
@@ -33,8 +57,9 @@ static int sendJSONResponse(int client_socket, const char *message) {
 
 static int handleClientMessage(int client_socket) {
   char buffer[BUFFER_SIZE];
-  int bytes_read = read(client_socket, buffer, sizeof(buffer) - 1);
+  int bytes_read = read_message(client_socket, buffer, sizeof(buffer) - 1);
   if (bytes_read <= 0) {
+    if (bytes_read == -EAGAIN) return 0;
     #ifndef NDEBUG
     printf("Client disconnected\n");
     #endif
@@ -59,8 +84,9 @@ static int handleClientMessage(int client_socket) {
 
 static int handleServerResponse(int server_socket) {
   char buffer[BUFFER_SIZE];
-  int bytes_read = read(server_socket, buffer, sizeof(buffer) - 1);
+  int bytes_read = read_message(server_socket, buffer, sizeof(buffer) - 1);
   if (bytes_read <= 0) {
+    if (bytes_read == -EAGAIN) return 0;
     #ifndef NDEBUG
     printf("Server disconnected\n");
     #endif
@@ -87,7 +113,7 @@ static int chatbot_create_socket(
   int (*check)(int , const struct sockaddr *, socklen_t)
 ) {
   struct addrinfo hints, *results, *rp;
-  int sock = -1, reuse = 1;
+  int sock = -1, reuse = 1, rc;
 
   memset(&hints, 0, sizeof(struct addrinfo));
   hints.ai_flags = AI_PASSIVE;
@@ -104,15 +130,11 @@ static int chatbot_create_socket(
   for (rp = results; rp != NULL; rp = rp->ai_next) {
     sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (sock < 0) continue;
-    if (setsockopt(
+    rc = setsockopt(
       sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
       (const char *)&reuse, sizeof(reuse)
-    )) {
-      close(sock);
-      sock = -1;
-      continue;
-    }
-    if (check(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
+    );
+    if (rc == 0 && check(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
       break;
     }
     close(sock);
@@ -122,6 +144,24 @@ static int chatbot_create_socket(
   freeaddrinfo(results);
   if (rp == NULL) return -1;
   return sock;
+}
+
+static int chatbot_accept_connection(
+  int server_socket, struct sockaddr_in *address
+) {
+  int addrlen = sizeof(*address);
+  int client_socket = accept(
+    server_socket, (struct sockaddr *)address, (socklen_t*)&addrlen
+  );
+  if (client_socket < 0) {
+    if (errno == EWOULDBLOCK || errno == EAGAIN) return 0;
+    return -1;
+  }
+  if (set_non_blocking(client_socket)) {
+    close(client_socket);
+    return -1;
+  }
+  return client_socket;
 }
 
 int chatbot_server() {
@@ -145,6 +185,14 @@ int chatbot_server() {
   if (listen(server_socket, 3) < 0) {
     #ifndef NDEBUG
     perror("Listen failed");
+    #endif
+    close(server_socket);
+    exit(EXIT_FAILURE);
+  }
+
+  if (set_non_blocking(server_socket)) {
+    #ifndef NDEBUG
+    perror("set_non_blocking");
     #endif
     close(server_socket);
     exit(EXIT_FAILURE);
@@ -174,8 +222,7 @@ int chatbot_server() {
     }
 
     if (FD_ISSET(server_socket, &read_fds)) {
-      int addrlen = sizeof(address);
-      client_socket = accept(server_socket, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+      client_socket = chatbot_accept_connection(server_socket, &address);
       if (client_socket < 0) {
         #ifndef NDEBUG
         perror("Accept failed");
@@ -183,7 +230,10 @@ int chatbot_server() {
         break;
       }
       #ifndef NDEBUG
-      printf("New connection from %s:%d\n", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+      printf(
+        "New connection from %s:%d\n", inet_ntoa(address.sin_addr),
+        ntohs(address.sin_port)
+      );
       #endif
 
       FD_SET(client_socket, &active_fd_set);
@@ -234,6 +284,14 @@ int chatbot_client() {
     exit(EXIT_FAILURE);
   }
 
+  if (set_non_blocking(client_socket)) {
+    #ifndef NDEBUG
+    perror("set_non_blocking");
+    #endif
+    close(client_socket);
+    return -1;
+  }
+
   #ifndef NDEBUG
   printf("Connected to the server at 127.0.0.1:%d\n", CHATBOT_PORT);
   #endif
@@ -253,17 +311,17 @@ int chatbot_client() {
       #endif
     }
 
+    if (FD_ISSET(client_socket, &read_fds)) {
+      if (handleServerResponse(client_socket) < 0) break;
+    }
+
     if (FD_ISSET(STDIN_FILENO, &read_fds)) {
       memset(buffer, 0, sizeof(buffer));
       if (!fgets(buffer, sizeof(buffer), stdin)) {
         break;
       }
       buffer[strcspn(buffer, "\n")] = 0;
-      if (send(client_socket, buffer, strlen(buffer), 0) < 0) break;
-    }
-
-    if (FD_ISSET(client_socket, &read_fds)) {
-      if (handleServerResponse(client_socket) < 0) break;
+      if (send_message(client_socket, buffer) < 0) break;
     }
   }
 
