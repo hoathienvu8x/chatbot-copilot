@@ -105,7 +105,8 @@ static int chatbot_create_socket(
     sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (sock < 0) continue;
     if (setsockopt(
-      sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)
+      sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
+      (const char *)&reuse, sizeof(reuse)
     )) {
       close(sock);
       sock = -1;
